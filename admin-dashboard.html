@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Admin Dashboard - Student Submissions</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 20px;
+      }
+      .submission {
+        border: 1px solid #ddd;
+        margin: 10px 0;
+        padding: 15px;
+        border-radius: 5px;
+      }
+      .download-btn {
+        background: #007bff;
+        color: white;
+        padding: 8px 15px;
+        border: none;
+        border-radius: 3px;
+        margin-right: 10px;
+        cursor: pointer;
+      }
+      .download-btn:hover {
+        background: #0056b3;
+      }
+      .delete-btn {
+        background: #dc3545;
+        color: white;
+        padding: 8px 15px;
+        border: none;
+        border-radius: 3px;
+        cursor: pointer;
+        margin-right: 5px;
+      }
+      .delete-btn:hover {
+        background: #c82333;
+      }
+      .host-btn {
+        background: #28a745;
+        color: white;
+        padding: 8px 15px;
+        border: none;
+        border-radius: 3px;
+        cursor: pointer;
+        margin-right: 5px;
+      }
+      .host-btn:hover {
+        background: #218838;
+      }
+      .unhost-btn {
+        background: #ffc107;
+        color: #212529;
+        padding: 8px 15px;
+        border: none;
+        border-radius: 3px;
+        cursor: pointer;
+        margin-right: 5px;
+      }
+      .unhost-btn:hover {
+        background: #e0a800;
+      }
+      .host-btn:disabled {
+        background: #6c757d;
+        cursor: not-allowed;
+        opacity: 0.6;
+      }
+      .hosted-link {
+        color: #28a745;
+        text-decoration: none;
+        font-weight: bold;
+        margin-left: 10px;
+      }
+      .hosted-link:hover {
+        text-decoration: underline;
+      }
+      h1 {
+        color: #333;
+      }
+      .meta {
+        color: #666;
+        font-size: 0.9em;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Admin Dashboard - Student VR Project Submissions</h1>
+    
+    <!-- Backup/Restore Section -->
+    <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 30px; border: 2px solid #dee2e6;">
+      <h2 style="margin-top: 0; color: #495057;">💾 Backup & Restore</h2>
+      <p style="color: #6c757d; margin-bottom: 15px;">
+        <strong>Before redeployment:</strong> Download all projects to prevent data loss.<br>
+        <strong>After redeployment:</strong> Upload the backup to restore all submissions.
+      </p>
+      
+      <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+        <button onclick="downloadBackup()" style="
+          background: #17a2b8; color: white; padding: 12px 24px; border: none;
+          border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 14px;
+          display: flex; align-items: center; gap: 8px;
+        " onmouseover="this.style.background='#138496'" onmouseout="this.style.background='#17a2b8'">
+          <span style="font-size: 20px;">📥</span>
+          Download All Projects
+        </button>
+        
+        <button onclick="document.getElementById('restore-file-input').click()" style="
+          background: #28a745; color: white; padding: 12px 24px; border: none;
+          border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 14px;
+          display: flex; align-items: center; gap: 8px;
+        " onmouseover="this.style.background='#218838'" onmouseout="this.style.background='#28a745'">
+          <span style="font-size: 20px;">📤</span>
+          Restore from Backup
+        </button>
+        
+        <input type="file" id="restore-file-input" accept=".zip" style="display: none;" onchange="restoreBackup(this.files[0])">
+      </div>
+      
+      <div id="backup-status" style="margin-top: 15px; padding: 10px; border-radius: 5px; display: none;"></div>
+    </div>
+
+    <h2 style="border-bottom: 2px solid #dee2e6; padding-bottom: 10px;">📚 Student Submissions</h2>
+    <div id="submissions">Loading submissions...</div>
+
+    <script>
+      async function loadSubmissions() {
+        try {
+          const response = await fetch("/admin/submissions");
+          const submissions = await response.json();
+
+          const container = document.getElementById("submissions");
+
+          if (submissions.length === 0) {
+            container.innerHTML = "<p>No submissions yet.</p>";
+            return;
+          }
+
+          container.innerHTML = submissions
+            .map((submission) => {
+              const isHosted = submission.isHosted || submission.hostedUrl;
+              const hostButton = isHosted
+                ? `<button class="unhost-btn" onclick="unhostProject('${submission.fileName}')">🔗 Unhost</button>`
+                : `<button class="host-btn" onclick="hostProject('${submission.fileName}', '${submission.studentName}')">🌐 Host</button>`;
+
+              return `
+                    <div class="submission" data-filename="${
+                      submission.fileName
+                    }">
+                        <h3>${submission.projectName}</h3>
+                        <div class="meta">
+                            <strong>Student:</strong> ${
+                              submission.studentName
+                            }<br>
+                            <strong>Submitted:</strong> ${new Date(
+                              submission.submittedAt
+                            ).toLocaleString()}<br>
+                            <strong>File:</strong> ${submission.fileName}
+                            ${
+                              submission.hostedUrl
+                                ? `<br><strong>🌐 Hosted at:</strong> <a href="${
+                                    submission.hostedUrl
+                                  }" class="hosted-link" target="_blank">${
+                                    submission.hostedPath || "View Live"
+                                  }</a>`
+                                : ""
+                            }
+                            ${
+                              submission.hostedAt
+                                ? `<br><strong>Hosted on:</strong> ${new Date(
+                                    submission.hostedAt
+                                  ).toLocaleString()}`
+                                : ""
+                            }
+                        </div>
+                        <br>
+                        <button class="download-btn" onclick="downloadProject('${
+                          submission.fileName
+                        }')">📥 Download</button>
+                        ${hostButton}
+                        <button class="delete-btn" onclick="deleteProject('${
+                          submission.fileName
+                        }')">🗑️ Delete</button>
+                    </div>
+                `;
+            })
+            .join("");
+        } catch (error) {
+          document.getElementById("submissions").innerHTML =
+            "<p>Error loading submissions.</p>";
+        }
+      }
+
+      async function downloadProject(filename) {
+        try {
+          // Create a temporary link element for download
+          const link = document.createElement("a");
+          link.href = `/admin/download/${filename}`;
+          link.download = filename;
+          link.style.display = "none";
+
+          // Add to document, click, and remove
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        } catch (error) {
+          alert("Error downloading project: " + error.message);
+        }
+      }
+
+      async function hostProject(filename, studentName) {
+        // Suggest a URL path based on student name
+        const suggestedPath = studentName
+          .replace(/[^a-zA-Z0-9]/g, "_")
+          .toLowerCase();
+        const urlPath = prompt(
+          `Host this project at what URL path?\n\nExample: If you enter "john_doe", the project will be available at:\n${window.location.origin}/hosted/john_doe/index.html`,
+          suggestedPath
+        );
+
+        if (!urlPath) return;
+
+        // Validate URL path
+        if (!/^[a-zA-Z0-9_-]+$/.test(urlPath)) {
+          alert(
+            "Invalid URL path. Please use only letters, numbers, underscores, and hyphens."
+          );
+          return;
+        }
+
+        try {
+          const response = await fetch(`/admin/host/${filename}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ urlPath }),
+          });
+
+          const result = await response.json();
+
+          if (result.success) {
+            alert(
+              `Project hosted successfully!\n\nLive URL: ${result.hostedUrl}\n\nThe project is now accessible to anyone with this link.`
+            );
+
+            // Reload submissions to show the hosted link
+            loadSubmissions();
+          } else {
+            alert("Error hosting project: " + result.message);
+          }
+        } catch (error) {
+          alert("Error hosting project: " + error.message);
+        }
+      }
+
+      async function unhostProject(filename) {
+        if (
+          !confirm(
+            "Are you sure you want to remove this project from hosting? The live URL will no longer work."
+          )
+        ) {
+          return;
+        }
+
+        try {
+          const response = await fetch(`/admin/unhost/${filename}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+          });
+
+          const result = await response.json();
+
+          if (result.success) {
+            alert(
+              "Project unhosted successfully! The live URL is no longer accessible."
+            );
+
+            // Reload submissions to update the display
+            loadSubmissions();
+          } else {
+            alert("Error unhosting project: " + result.message);
+          }
+        } catch (error) {
+          alert("Error unhosting project: " + error.message);
+        }
+      }
+
+      async function deleteProject(filename) {
+        if (!confirm(`Are you sure you want to delete ${filename}?`)) {
+          return;
+        }
+
+        try {
+          const response = await fetch(`/admin/delete/${filename}`, {
+            method: "DELETE",
+          });
+
+          const result = await response.json();
+
+          if (result.success) {
+            // Remove the submission from the display
+            const submissionElement = document.querySelector(
+              `[data-filename="${filename}"]`
+            );
+            if (submissionElement) {
+              submissionElement.remove();
+            }
+
+            // Reload submissions to ensure consistency
+            setTimeout(loadSubmissions, 500);
+          } else {
+            alert("Error deleting project: " + result.message);
+          }
+        } catch (error) {
+          alert("Error deleting project: " + error.message);
+        }
+      }
+
+      loadSubmissions();
+
+      // Refresh every 30 seconds, but pause if user is interacting
+      let refreshInterval;
+      let lastActivity = Date.now();
+
+      function startAutoRefresh() {
+        refreshInterval = setInterval(() => {
+          // Only refresh if user hasn't been active for at least 10 seconds
+          if (Date.now() - lastActivity > 10000) {
+            loadSubmissions();
+          }
+        }, 30000);
+      }
+
+      // Track user activity
+      document.addEventListener("click", () => {
+        lastActivity = Date.now();
+      });
+
+      document.addEventListener("mousemove", () => {
+        lastActivity = Date.now();
+      });
+
+      startAutoRefresh();
+
+      // Backup & Restore Functions
+      async function downloadBackup() {
+        const statusDiv = document.getElementById("backup-status");
+        statusDiv.style.display = "block";
+        statusDiv.style.background = "#d1ecf1";
+        statusDiv.style.color = "#0c5460";
+        statusDiv.style.border = "1px solid #bee5eb";
+        statusDiv.innerHTML = "📦 Creating backup... Please wait.";
+
+        try {
+          const response = await fetch("/admin/backup-all");
+          
+          if (!response.ok) {
+            throw new Error("Failed to create backup");
+          }
+
+          // Get the filename from Content-Disposition header or generate one
+          const contentDisposition = response.headers.get("Content-Disposition");
+          let filename = `vr-projects-backup-${Date.now()}.zip`;
+          if (contentDisposition) {
+            const matches = /filename="(.+)"/.exec(contentDisposition);
+            if (matches) filename = matches[1];
+          }
+
+          // Download the file
+          const blob = await response.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          window.URL.revokeObjectURL(url);
+
+          statusDiv.style.background = "#d4edda";
+          statusDiv.style.color = "#155724";
+          statusDiv.style.border = "1px solid #c3e6cb";
+          statusDiv.innerHTML = "✅ Backup downloaded successfully! Keep this file safe before redeployment.";
+          
+          setTimeout(() => {
+            statusDiv.style.display = "none";
+          }, 5000);
+        } catch (error) {
+          statusDiv.style.background = "#f8d7da";
+          statusDiv.style.color = "#721c24";
+          statusDiv.style.border = "1px solid #f5c6cb";
+          statusDiv.innerHTML = "❌ Error creating backup: " + error.message;
+        }
+      }
+
+      async function restoreBackup(file) {
+        if (!file) return;
+
+        if (!confirm("⚠️ Warning: This will restore all projects from the backup file. Any current data will be merged (duplicates may occur). Continue?")) {
+          return;
+        }
+
+        const statusDiv = document.getElementById("backup-status");
+        statusDiv.style.display = "block";
+        statusDiv.style.background = "#d1ecf1";
+        statusDiv.style.color = "#0c5460";
+        statusDiv.style.border = "1px solid #bee5eb";
+        statusDiv.innerHTML = "📤 Restoring backup... Please wait (this may take a minute).";
+
+        try {
+          const formData = new FormData();
+          formData.append("backup", file);
+
+          const response = await fetch("/admin/restore-backup", {
+            method: "POST",
+            body: formData
+          });
+
+          const result = await response.json();
+
+          if (result.success) {
+            statusDiv.style.background = "#d4edda";
+            statusDiv.style.color = "#155724";
+            statusDiv.style.border = "1px solid #c3e6cb";
+            statusDiv.innerHTML = "✅ Backup restored successfully! Reloading submissions...";
+            
+            // Reload submissions after 2 seconds
+            setTimeout(() => {
+              loadSubmissions();
+              statusDiv.style.display = "none";
+            }, 2000);
+          } else {
+            throw new Error(result.error || "Restore failed");
+          }
+        } catch (error) {
+          statusDiv.style.background = "#f8d7da";
+          statusDiv.style.color = "#721c24";
+          statusDiv.style.border = "1px solid #f5c6cb";
+          statusDiv.innerHTML = "❌ Error restoring backup: " + error.message;
+        }
+
+        // Reset file input
+        document.getElementById("restore-file-input").value = "";
+      }
+    </script>
+  </body>
+</html>

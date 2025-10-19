@@ -1,0 +1,1550 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VR Hotspot Style Editor</title>
+    <script src="./node_modules/aframe/dist/aframe-v1.7.1.min.js"></script>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background: linear-gradient(135deg, #1e3c72, #2a5298);
+        color: white;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      .header {
+        background: rgba(0, 0, 0, 0.8);
+        padding: 15px 30px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+      }
+
+      .header h1 {
+        font-size: 24px;
+        font-weight: 300;
+        display: flex;
+        align-items: center;
+        gap: 15px;
+      }
+
+      .header-buttons {
+        display: flex;
+        gap: 15px;
+        align-items: center;
+      }
+
+      .hamburger-btn {
+        background: #333;
+        border: none;
+        color: white;
+        padding: 8px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 18px;
+        transition: all 0.3s ease;
+      }
+
+      .hamburger-btn:hover {
+        background: #555;
+      }
+
+      .btn {
+        padding: 10px 20px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 500;
+        transition: all 0.3s ease;
+      }
+
+      .btn-primary {
+        background: #4caf50;
+        color: white;
+      }
+
+      .btn-secondary {
+        background: #666;
+        color: white;
+      }
+
+      .btn-danger {
+        background: #f44336;
+        color: white;
+      }
+
+      .btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      }
+
+      .main-container {
+        display: grid;
+        grid-template-columns: 400px 1fr;
+        height: calc(100vh - 70px);
+        transition: grid-template-columns 0.3s ease;
+      }
+
+      .main-container.collapsed {
+        grid-template-columns: 0px 1fr;
+      }
+
+      .controls-panel {
+        background: rgba(0, 0, 0, 0.9);
+        padding: 20px;
+        overflow-y: auto;
+        border-right: 2px solid #333;
+        transition: all 0.3s ease;
+        width: 400px;
+      }
+
+      .controls-panel.collapsed {
+        width: 0;
+        padding: 0;
+        overflow: hidden;
+        border-right: none;
+      }
+
+      .preview-panel {
+        position: relative;
+        background: #000;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 100%;
+      }
+
+      .control-section {
+        margin-bottom: 30px;
+        padding: 20px;
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+      }
+
+      .section-title {
+        font-size: 18px;
+        font-weight: 600;
+        margin-bottom: 15px;
+        color: #4caf50;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .form-group {
+        margin-bottom: 15px;
+      }
+
+      .form-group label {
+        display: block;
+        margin-bottom: 5px;
+        font-size: 14px;
+        color: #ccc;
+      }
+
+      .form-group input[type="color"] {
+        width: 100%;
+        height: 45px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+
+      .form-group input[type="text"] {
+        width: 100%;
+        padding: 10px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.3);
+        border-radius: 6px;
+        color: white;
+        font-size: 14px;
+      }
+
+      .form-group input[type="range"] {
+        width: 100%;
+        margin: 5px 0;
+      }
+
+      .range-display {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: 5px;
+      }
+
+      .range-value {
+        background: rgba(255, 255, 255, 0.2);
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+
+      .preview-overlay {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        background: rgba(0, 0, 0, 0.8);
+        padding: 15px;
+        border-radius: 8px;
+        z-index: 1000;
+        min-width: 200px;
+      }
+
+      .preview-overlay-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .preview-overlay-title {
+        font-size: 14px;
+        color: #ccc;
+        font-weight: 600;
+      }
+
+      .preview-overlay-toggle {
+        background: none;
+        border: none;
+        color: #4caf50;
+        font-size: 16px;
+        cursor: pointer;
+        padding: 0;
+        transition: transform 0.3s ease;
+      }
+
+      .preview-overlay-toggle.collapsed {
+        transform: rotate(-90deg);
+      }
+
+      .preview-overlay-content {
+        margin-top: 10px;
+        max-height: 500px;
+        overflow: hidden;
+        transition: max-height 0.3s ease, opacity 0.3s ease;
+      }
+
+      .preview-overlay-content.collapsed {
+        max-height: 0;
+        opacity: 0;
+        margin-top: 0;
+      }
+
+      .preview-info {
+        font-size: 14px;
+        color: #ccc;
+        margin-bottom: 10px;
+      }
+
+      .live-indicator {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: #4caf50;
+      }
+
+      .live-dot {
+        width: 8px;
+        height: 8px;
+        background: #4caf50;
+        border-radius: 50%;
+        animation: pulse 2s infinite;
+      }
+
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.5;
+        }
+      }
+
+      .hotspot-demo {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 100;
+      }
+
+      /* Custom scrollbar */
+      .controls-panel::-webkit-scrollbar {
+        width: 8px;
+      }
+
+      .controls-panel::-webkit-scrollbar-track {
+        background: rgba(255, 255, 255, 0.1);
+      }
+
+      .controls-panel::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.3);
+        border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <h1>
+        <button
+          class="hamburger-btn"
+          onclick="togglePanel()"
+          id="hamburger-btn"
+        >
+          ☰
+        </button>
+        🎨 VR Hotspot Style Editor
+      </h1>
+      <div class="header-buttons">
+        <button class="btn btn-secondary" onclick="resetToDefaults()">
+          🔄 Reset All
+        </button>
+        <button class="btn btn-primary" onclick="saveAndReturn()">
+          ✅ Save & Return
+        </button>
+        <button class="btn btn-secondary" onclick="returnWithoutSaving()">
+          ❌ Cancel
+        </button>
+      </div>
+    </div>
+
+    <div class="main-container" id="main-container">
+      <div class="controls-panel" id="controls-panel">
+        <!-- Info Button Controls -->
+        <div class="control-section">
+          <div class="section-title">📝 Info Button</div>
+
+          <div class="form-group">
+            <label>Background Color</label>
+            <input
+              type="color"
+              id="info-bg-color"
+              value="#4A90E2"
+              onchange="updatePreview()"
+            />
+          </div>
+
+          <div class="form-group">
+            <label>Text Color</label>
+            <input
+              type="color"
+              id="info-text-color"
+              value="#000000"
+              onchange="updatePreview()"
+            />
+          </div>
+
+          <div class="form-group">
+            <label>Icon Size</label>
+            <input
+              type="range"
+              id="info-size"
+              min="0.1"
+              max="0.5"
+              step="0.05"
+              value="0.3"
+              oninput="updatePreview(); updateRangeDisplay('info-size')"
+            />
+            <div class="range-display">
+              <span>Small (0.1)</span>
+              <span id="info-size-value">0.3</span>
+              <span>Large (0.5)</span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Font Size</label>
+            <input
+              type="range"
+              id="info-font-size"
+              min="4"
+              max="16"
+              value="8"
+              oninput="updatePreview(); updateRangeDisplay('info-font-size')"
+            />
+            <div class="range-display">
+              <span>Small (4)</span>
+              <span class="range-value" id="info-font-size-value">8</span>
+              <span>Large (16)</span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Opacity</label>
+            <input
+              type="range"
+              id="info-opacity"
+              min="0.2"
+              max="1"
+              step="0.05"
+              value="0.9"
+              oninput="updatePreview(); updateRangeDisplay('info-opacity')"
+            />
+            <div class="range-display">
+              <span>Transparent (0.2)</span>
+              <span class="range-value" id="info-opacity-value">0.9</span>
+              <span>Solid (1.0)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Popup Controls -->
+        <div class="control-section">
+          <div class="section-title">💬 Popup Window</div>
+
+          <div class="form-group">
+            <label>Background Color</label>
+            <input
+              type="color"
+              id="popup-bg-color"
+              value="#333333"
+              onchange="updatePreview()"
+            />
+          </div>
+
+          <div class="form-group">
+            <label>Text Color</label>
+            <input
+              type="color"
+              id="popup-text-color"
+              value="#FFFFFF"
+              onchange="updatePreview()"
+            />
+          </div>
+
+          <div class="form-group">
+            <label>Opacity</label>
+            <input
+              type="range"
+              id="popup-opacity"
+              min="0.3"
+              max="1"
+              step="0.1"
+              value="0.95"
+              oninput="updatePreview(); updateRangeDisplay('popup-opacity')"
+            />
+            <div class="range-display">
+              <span>Transparent (0.3)</span>
+              <span class="range-value" id="popup-opacity-value">0.95</span>
+              <span>Solid (1.0)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Button Images Controls -->
+        <div class="control-section">
+          <div class="section-title">🖼️ Button Images</div>
+
+          <div class="form-group">
+            <label>Play Button Image</label>
+            <div style="display: flex; gap: 8px; margin-bottom: 8px">
+              <button
+                type="button"
+                onclick="uploadPlayImage()"
+                style="
+                  flex: 1;
+                  padding: 8px;
+                  background: #4caf50;
+                  color: white;
+                  border: none;
+                  border-radius: 4px;
+                  cursor: pointer;
+                  font-size: 12px;
+                "
+              >
+                📁 Upload
+              </button>
+              <button
+                type="button"
+                onclick="resetPlayImage()"
+                style="
+                  flex: 1;
+                  padding: 8px;
+                  background: #666;
+                  color: white;
+                  border: none;
+                  border-radius: 4px;
+                  cursor: pointer;
+                  font-size: 12px;
+                "
+              >
+                🔄 Reset
+              </button>
+            </div>
+            <input
+              type="url"
+              id="play-image-url"
+              placeholder="Or enter image URL..."
+              oninput="updatePlayImageFromURL()"
+              style="
+                width: 100%;
+                padding: 8px;
+                background: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                border-radius: 6px;
+                color: white;
+                font-size: 12px;
+              "
+            />
+            <input
+              type="file"
+              id="play-image-upload"
+              accept="image/*"
+              style="display: none"
+              onchange="handlePlayImageUpload()"
+            />
+          </div>
+
+          <div class="form-group">
+            <label>Pause Button Image</label>
+            <div style="display: flex; gap: 8px; margin-bottom: 8px">
+              <button
+                type="button"
+                onclick="uploadPauseImage()"
+                style="
+                  flex: 1;
+                  padding: 8px;
+                  background: #4caf50;
+                  color: white;
+                  border: none;
+                  border-radius: 4px;
+                  cursor: pointer;
+                  font-size: 12px;
+                "
+              >
+                📁 Upload
+              </button>
+              <button
+                type="button"
+                onclick="resetPauseImage()"
+                style="
+                  flex: 1;
+                  padding: 8px;
+                  background: #666;
+                  color: white;
+                  border: none;
+                  border-radius: 4px;
+                  cursor: pointer;
+                  font-size: 12px;
+                "
+              >
+                🔄 Reset
+              </button>
+            </div>
+            <input
+              type="url"
+              id="pause-image-url"
+              placeholder="Or enter image URL..."
+              oninput="updatePauseImageFromURL()"
+              style="
+                width: 100%;
+                padding: 8px;
+                background: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                border-radius: 6px;
+                color: white;
+                font-size: 12px;
+              "
+            />
+            <input
+              type="file"
+              id="pause-image-upload"
+              accept="image/*"
+              style="display: none"
+              onchange="handlePauseImageUpload()"
+            />
+          </div>
+        </div>
+
+        <!-- Navigation Portal (Ring) Controls -->
+        <div class="control-section">
+          <div class="section-title">🧭 Navigation Portal (Ring)</div>
+
+          <div class="form-group">
+            <label>Ring Color</label>
+            <input type="color" id="nav-ring-color" value="#005500" onchange="updatePreview()" />
+          </div>
+
+          <div class="form-group">
+            <label>Weblink Ring Color</label>
+            <input type="color" id="nav-weblink-ring-color" value="#001f5b" onchange="updatePreview()" />
+          </div>
+
+          <div class="form-group">
+            <label>Outer Radius</label>
+            <input type="range" id="nav-ring-outer" min="0.2" max="1.2" step="0.01" value="0.6" oninput="updatePreview(); updateRangeDisplay('nav-ring-outer')" />
+            <div class="range-display">
+              <span>Small (0.2)</span>
+              <span class="range-value" id="nav-ring-outer-value">0.6</span>
+              <span>Large (1.2)</span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Thickness</label>
+            <input type="range" id="nav-ring-thickness" min="0.002" max="0.08" step="0.001" value="0.02" oninput="updatePreview(); updateRangeDisplay('nav-ring-thickness')" />
+            <div class="range-display">
+              <span>Thin (0.002)</span>
+              <span class="range-value" id="nav-ring-thickness-value">0.02</span>
+              <span>Thick (0.08)</span>
+            </div>
+          </div>
+
+          <div style="height:8px"></div>
+          <div class="section-title" style="margin-top: 2px;">🏷️ Portal Title (Hover Label)</div>
+
+          <div class="form-group">
+            <label>Label Background Color</label>
+            <input type="color" id="nav-label-bg-color" value="#000000" onchange="updatePreview()" />
+          </div>
+
+          <div class="form-group">
+            <label>Label Text Color</label>
+            <input type="color" id="nav-label-text-color" value="#FFFFFF" onchange="updatePreview()" />
+          </div>
+
+          <div class="form-group">
+            <label>Label Background Opacity</label>
+            <input type="range" id="nav-label-opacity" min="0" max="1" step="0.05" value="0.8" oninput="updatePreview(); updateRangeDisplay('nav-label-opacity')" />
+            <div class="range-display">
+              <span>Transparent (0)</span>
+              <span class="range-value" id="nav-label-opacity-value">0.8</span>
+              <span>Solid (1.0)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Image Hotspot Controls -->
+        <div class="control-section">
+          <div class="section-title">🖼️ Image Hotspot</div>
+
+          <div class="form-group">
+            <label>Border Color</label>
+            <input type="color" id="image-border-color" value="#FFFFFF" onchange="updatePreview()" />
+          </div>
+
+            <div class="form-group">
+              <label>Border Width</label>
+              <input type="range" id="image-border-width" min="0" max="0.2" step="0.005" value="0.02" oninput="updatePreview(); updateRangeDisplay('image-border-width')" />
+              <div class="range-display">
+                <span>None (0)</span>
+                <span class="range-value" id="image-border-width-value">0.02</span>
+                <span>Wide (0.2)</span>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>Opacity</label>
+              <input type="range" id="image-opacity" min="0.1" max="1" step="0.05" value="1.0" oninput="updatePreview(); updateRangeDisplay('image-opacity')" />
+              <div class="range-display">
+                <span>Transparent (0.1)</span>
+                <span class="range-value" id="image-opacity-value">1.0</span>
+                <span>Solid (1.0)</span>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>Corner Radius (visual only)</label>
+              <input type="range" id="image-border-radius" min="0" max="0.25" step="0.01" value="0.05" oninput="updatePreview(); updateRangeDisplay('image-border-radius')" />
+              <div class="range-display">
+                <span>Square (0)</span>
+                <span class="range-value" id="image-border-radius-value">0.05</span>
+                <span>Round (0.25)</span>
+              </div>
+            </div>
+            <div style="font-size:11px; color:#aaa; line-height:1.3; margin-top:4px;">Rounded corners are now baked into image textures on save/export. Large images may take slightly longer to process.</div>
+        </div>
+      </div>
+
+      <div class="preview-panel">
+        <div class="preview-overlay">
+          <div class="preview-overlay-header" onclick="toggleInstructions()">
+            <div class="preview-overlay-title">Instructions</div>
+            <button class="preview-overlay-toggle collapsed" id="instructions-toggle">▼</button>
+          </div>
+          <div class="preview-overlay-content collapsed" id="instructions-content">
+            <div class="preview-info">Live Preview</div>
+            <div class="live-indicator">
+              <div class="live-dot"></div>
+              <span>Real-time updates</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 12px; color: #888">
+              💡 Tip: Use mouse or gaze to click the green info button to test
+              popup
+            </div>
+          </div>
+        </div>
+
+        <a-scene
+          id="preview-scene"
+          embedded
+          style="height: 100%; width: 100%"
+          vr-mode-ui="enabled: false"
+          background="color: #ECECEC"
+        >
+          <!-- VR Controllers -->
+          <a-entity
+            laser-controls="hand: right"
+            raycaster="objects: .clickable, .audio-control"
+          ></a-entity>
+          <a-entity
+            laser-controls="hand: left"
+            raycaster="objects: .clickable, .audio-control"
+          ></a-entity>
+
+          <a-assets>
+            <img id="preview-panorama" src="./images/scene1.jpg" />
+            <img id="play" src="./images/play.png" />
+            <img id="pause" src="./images/pause.png" />
+            <img id="close" src="./images/close.png" />
+          </a-assets>
+
+          <a-sky id="preview-sky" src="#preview-panorama"></a-sky>
+
+          <!-- Demo Hotspots for Preview -->
+          <a-entity id="demo-text-hotspot" position="2 1 -1">
+            <a-entity
+              id="demo-info-button"
+              geometry="primitive: circle; radius: 0.15"
+              material="color: #0066CC"
+              text="value: i; align: center; color: white; width: 12"
+              position="0 1 -0.1"
+              class="clickable"
+            >
+            </a-entity>
+
+            <a-entity id="demo-popup" visible="false" position="0 1.5 0">
+              <a-plane
+                id="demo-popup-bg"
+                color="#333333"
+                width="4"
+                height="2.5"
+                opacity="0.95"
+              >
+              </a-plane>
+              <a-text
+                id="demo-popup-text"
+                value="Sample popup text"
+                wrap-count="30"
+                color="white"
+                position="0 0 0.01"
+                align="center"
+              >
+              </a-text>
+              <a-image
+                id="demo-close-btn"
+                src="#close"
+                width="0.4"
+                height="0.4"
+                position="1.7 1 0.02"
+                class="clickable"
+              >
+              </a-image>
+            </a-entity>
+          </a-entity>
+          </a-entity>
+
+          <!-- Demo Navigation Ring -->
+          <a-entity id="demo-nav" position="-2 1 -1">
+            <a-entity id="demo-nav-collider" geometry="primitive: circle; radius: 0.6" material="opacity: 0; transparent: true; depthWrite: false; side: double"></a-entity>
+            <a-entity id="demo-nav-ring" geometry="primitive: ring; radiusInner: 0.595; radiusOuter: 0.6" material="color: rgb(0,85,0); opacity: 1; transparent: true; shader: flat" position="0 0 0.01"></a-entity>
+            <a-entity id="demo-nav-preview" geometry="primitive: circle; radius: 0.595" material="transparent: true; opacity: 1; shader: flat; side: double; alphaTest: 0.01" visible="false" position="0 0 0"></a-entity>
+            <a-entity id="demo-nav-label" position="0 0.95 0.02" visible="true">
+              <a-plane id="demo-nav-label-bg" width="1.8" height="0.35" material="shader:flat; color: #000; opacity: 0.8; transparent: true" position="0 0 0"></a-plane>
+              <a-text id="demo-nav-label-text" value="Portal to Scene 2" align="center" color="#fff" width="5" position="0 0 0.01"></a-text>
+            </a-entity>
+            <a-text value="Portal Ring" color="#fff" position="0 -0.9 0" align="center" width="3"></a-text>
+          </a-entity>
+
+          <!-- Demo Weblink Ring (shifted right/up to avoid overlap with image preview) -->
+          <a-entity id="demo-weblink" position="-4 1 -1">
+            <a-entity id="demo-weblink-collider" geometry="primitive: circle; radius: 0.6" material="opacity: 0; transparent: true; depthWrite: false; side: double"></a-entity>
+            <a-entity id="demo-weblink-ring" geometry="primitive: ring; radiusInner: 0.595; radiusOuter: 0.6" material="color: #001f5b; opacity: 1; transparent: true; shader: flat" position="0 0 0.01"></a-entity>
+            <a-entity id="demo-weblink-preview" geometry="primitive: circle; radius: 0.595" material="transparent: true; opacity: 1; shader: flat; side: double; alphaTest: 0.01" visible="false" position="0 0 0"></a-entity>
+            <a-entity id="demo-weblink-label" position="0 0.95 0.02" visible="true">
+              <a-plane id="demo-weblink-label-bg" width="1.8" height="0.35" material="shader:flat; color: #000; opacity: 0.8; transparent: true" position="0 0 0"></a-plane>
+              <a-text id="demo-weblink-label-text" value="Open Link" align="center" color="#fff" width="5" position="0 0 0.01"></a-text>
+            </a-entity>
+            <a-text value="Weblink Ring" color="#fff" position="0 -0.9 0" align="center" width="3"></a-text>
+          </a-entity>
+
+          <!-- Audio Controls Demo -->
+          <a-entity id="demo-audio-controls" position="2 0 -1">
+            <a-image
+              id="demo-play-button"
+              src="images/play.png"
+              width="0.6"
+              height="0.6"
+              material="color: white"
+              position="-0.5 0 0"
+            >
+            </a-image>
+            <a-image
+              id="demo-pause-button"
+              src="images/pause.png"
+              width="0.6"
+              height="0.6"
+              material="color: white"
+              position="0.5 0 0"
+            >
+            </a-image>
+            <a-text
+              value="Audio Buttons"
+              color="white"
+              position="0 -1 0"
+              align="center"
+              width="6"
+            >
+            </a-text>
+          </a-entity>
+
+          <!-- Image Hotspot Demo -->
+          <a-entity id="demo-image-hotspot" position="0 0 -2.2">
+            <a-plane class="demo-image-border" color="#FFFFFF" width="2.6" height="1.6" position="0 0.8 0" material="opacity:1; transparent:false; side:double; shader:flat"></a-plane>
+            <a-image class="demo-image" src="./images/newhouse.jpg" width="2.5" height="1.5" position="0 0.8 0.05" material="opacity:1; transparent:true; side:double; shader:flat; alphaTest:0.01"></a-image>
+            <a-text value="Image Hotspot Preview" position="0 -0.2 0" align="center" width="6" color="#fff"></a-text>
+          </a-entity>
+
+          <a-camera
+            id="preview-camera"
+            position="0 1.6 3"
+            look-controls="enabled: true"
+            wasd-controls="enabled: false"
+          >
+            <!-- Mouse-based cursor for non-VR mode -->
+            <a-entity
+              cursor="rayOrigin: mouse; fuse: false"
+              raycaster="objects: .clickable, .audio-control, #preview-sky"
+              id="mouse-cursor"
+              visible="true"
+            >
+            </a-entity>
+
+            <!-- Gaze-based cursor for VR mode -->
+            <a-entity
+              cursor="fuse: true; fuseTimeout: 1500"
+              raycaster="objects: .clickable, .audio-control, #preview-sky"
+              position="0 0 -1"
+              geometry="primitive: ring; radiusInner: 0.005; radiusOuter: 0.01"
+              material="color: white; shader: flat; opacity: 0.8"
+              id="gaze-cursor"
+              visible="true"
+              animation__mouseenter="property: geometry.radiusOuter; to: 0.015; startEvents: mouseenter; dur: 1500; easing: easeInQuad"
+              animation__mouseleave="property: geometry.radiusOuter; to: 0.01; startEvents: mouseleave; dur: 300; easing: easeOutQuad"
+              animation__click="property: scale; to: 1.2 1.2 1.2; startEvents: click; dur: 150; easing: easeInOutQuad"
+              animation__fusing="property: scale; to: 1.2 1.2 1.2; startEvents: fusing; dur: 1500; easing: easeInQuad"
+              animation__fusecomplete="property: scale; to: 1 1 1; startEvents: click; dur: 150; easing: easeOutQuad"
+            >
+            </a-entity>
+          </a-camera>
+        </a-scene>
+      </div>
+    </div>
+
+    <script>
+      // Panel toggle functionality
+      function togglePanel() {
+        const mainContainer = document.getElementById("main-container");
+        const controlsPanel = document.getElementById("controls-panel");
+        const hamburgerBtn = document.getElementById("hamburger-btn");
+
+        if (mainContainer.classList.contains("collapsed")) {
+          mainContainer.classList.remove("collapsed");
+          controlsPanel.classList.remove("collapsed");
+          hamburgerBtn.innerHTML = "☰";
+        } else {
+          mainContainer.classList.add("collapsed");
+          controlsPanel.classList.add("collapsed");
+          hamburgerBtn.innerHTML = "▶";
+        }
+      }
+
+      // Global variables for managing styles
+      let currentStyles = {
+        hotspot: {
+          infoButton: {
+            backgroundColor: "#4A90E2",
+            textColor: "#FFFFFF",
+            fontSize: 12,
+            opacity: 0.9,
+            size: 0.3,
+          },
+          popup: {
+            backgroundColor: "#333333",
+            textColor: "#FFFFFF",
+            borderWidth: 0,
+            borderRadius: 0,
+            opacity: 0.95,
+            fontSize: 1,
+            padding: 0.2,
+          },
+          closeButton: {
+            size: 0.4,
+            opacity: 1.0,
+          },
+        },
+        navigation: {
+          labelColor: "#FFFFFF",
+          labelBackgroundColor: "#000000",
+          labelOpacity: 0.8,
+          ringColor: "#005500",
+          weblinkRingColor: "#001f5b",
+          ringOuterRadius: 0.6,
+            ringThickness: 0.08,
+        },
+        buttonImages: {
+          play: "images/play.png",
+          pause: "images/pause.png",
+        },
+        image: {
+          borderColor: "#FFFFFF",
+          borderWidth: 0.02,
+          opacity: 1.0,
+          borderRadius: 0.05,
+        },
+      };
+
+      // Load styles from localStorage or URL params
+      function loadCurrentStyles() {
+        // First try localStorage (preferred method)
+        const saved = localStorage.getItem("vr-hotspot-css-styles");
+        if (saved) {
+          try {
+            currentStyles = JSON.parse(saved);
+            console.log("✅ Style Editor - Loaded styles from localStorage");
+          } catch (e) {
+            console.warn("Failed to load saved styles from localStorage");
+          }
+        } else {
+          console.log(
+            "ℹ️ Style Editor - No saved styles found in localStorage"
+          );
+          // Fallback to URL parameters (for backward compatibility)
+          const urlParams = new URLSearchParams(window.location.search);
+          const stylesParam = urlParams.get("styles");
+
+          if (stylesParam) {
+            try {
+              currentStyles = JSON.parse(decodeURIComponent(stylesParam));
+            } catch (e) {
+              console.warn("Failed to parse styles from URL");
+            }
+          }
+        }
+
+        // Ensure buttonImages exists for backward compatibility
+        if (!currentStyles.buttonImages) {
+          currentStyles.buttonImages = {
+            play: "images/play.png",
+            pause: "images/pause.png",
+          };
+        }
+
+        // Ensure new navigation ring defaults exist
+        if (!currentStyles.navigation) currentStyles.navigation = {};
+        if (currentStyles.navigation.ringColor === undefined)
+          currentStyles.navigation.ringColor = "#005500";
+        if (currentStyles.navigation.ringOuterRadius === undefined)
+          currentStyles.navigation.ringOuterRadius = 0.6;
+        if (currentStyles.navigation.ringThickness === undefined)
+          currentStyles.navigation.ringThickness = 0.02;
+        if (currentStyles.navigation.weblinkRingColor === undefined)
+          currentStyles.navigation.weblinkRingColor = "#001f5b";
+        if (currentStyles.navigation.labelColor === undefined)
+          currentStyles.navigation.labelColor = "#FFFFFF";
+        if (currentStyles.navigation.labelBackgroundColor === undefined)
+          currentStyles.navigation.labelBackgroundColor = "#000000";
+        if (currentStyles.navigation.labelOpacity === undefined)
+          currentStyles.navigation.labelOpacity = 0.8;
+
+        // Ensure image style defaults
+        if (!currentStyles.image) {
+          currentStyles.image = { borderColor: "#FFFFFF", borderWidth: 0.02, opacity: 1.0, borderRadius: 0.05 };
+        } else {
+          if (currentStyles.image.borderColor === undefined) currentStyles.image.borderColor = "#FFFFFF";
+          if (currentStyles.image.borderWidth === undefined) currentStyles.image.borderWidth = 0.02;
+          if (currentStyles.image.opacity === undefined) currentStyles.image.opacity = 1.0;
+          if (currentStyles.image.borderRadius === undefined) currentStyles.image.borderRadius = 0.05;
+        }
+
+        // Update form values
+        updateFormValues();
+        updatePreview();
+      }
+
+      function updateFormValues() {
+        document.getElementById("info-bg-color").value =
+          currentStyles.hotspot.infoButton.backgroundColor;
+        document.getElementById("info-text-color").value =
+          currentStyles.hotspot.infoButton.textColor;
+        document.getElementById("info-size").value =
+          currentStyles.hotspot.infoButton.size;
+        document.getElementById("info-font-size").value =
+          currentStyles.hotspot.infoButton.fontSize;
+        document.getElementById("info-opacity").value =
+          currentStyles.hotspot.infoButton.opacity;
+
+        document.getElementById("popup-bg-color").value =
+          currentStyles.hotspot.popup.backgroundColor;
+        document.getElementById("popup-text-color").value =
+          currentStyles.hotspot.popup.textColor;
+        document.getElementById("popup-opacity").value =
+          currentStyles.hotspot.popup.opacity;
+
+        // Update range displays
+        updateRangeDisplay("info-font-size");
+        updateRangeDisplay("info-opacity");
+        updateRangeDisplay("popup-opacity");
+
+        // Navigation ring
+        document.getElementById("nav-ring-color").value =
+          currentStyles.navigation.ringColor;
+        const weblinkClr = document.getElementById("nav-weblink-ring-color");
+        if (weblinkClr) weblinkClr.value = currentStyles.navigation.weblinkRingColor || "#001f5b";
+        document.getElementById("nav-ring-outer").value =
+          currentStyles.navigation.ringOuterRadius;
+        document.getElementById("nav-ring-thickness").value =
+          currentStyles.navigation.ringThickness;
+        updateRangeDisplay("nav-ring-outer");
+        updateRangeDisplay("nav-ring-thickness");
+
+  // Navigation label styles
+  const nlbg = document.getElementById("nav-label-bg-color");
+  if (nlbg) nlbg.value = currentStyles.navigation.labelBackgroundColor || "#000000";
+  const nltc = document.getElementById("nav-label-text-color");
+  if (nltc) nltc.value = currentStyles.navigation.labelColor || "#FFFFFF";
+  const nlop = document.getElementById("nav-label-opacity");
+  if (nlop) nlop.value = currentStyles.navigation.labelOpacity ?? 0.8;
+  updateRangeDisplay("nav-label-opacity");
+
+        // Image hotspot styles
+        if (currentStyles.image) {
+          const imgStyles = currentStyles.image;
+          const bc = document.getElementById('image-border-color');
+          if (bc) bc.value = imgStyles.borderColor || '#FFFFFF';
+          const bw = document.getElementById('image-border-width');
+          if (bw) bw.value = imgStyles.borderWidth ?? 0.02;
+          const op = document.getElementById('image-opacity');
+          if (op) op.value = imgStyles.opacity ?? 1.0;
+          const br = document.getElementById('image-border-radius');
+          if (br) br.value = imgStyles.borderRadius ?? 0.05;
+          updateRangeDisplay('image-border-width');
+          updateRangeDisplay('image-opacity');
+          updateRangeDisplay('image-border-radius');
+        }
+
+        // Update button image fields
+        if (currentStyles.buttonImages) {
+          if (
+            currentStyles.buttonImages.play &&
+            !currentStyles.buttonImages.play.startsWith("images/")
+          ) {
+            document.getElementById("play-image-url").value =
+              currentStyles.buttonImages.play;
+          } else {
+            document.getElementById("play-image-url").value = "";
+          }
+
+          if (
+            currentStyles.buttonImages.pause &&
+            !currentStyles.buttonImages.pause.startsWith("images/")
+          ) {
+            document.getElementById("pause-image-url").value =
+              currentStyles.buttonImages.pause;
+          } else {
+            document.getElementById("pause-image-url").value = "";
+          }
+        }
+      }
+
+      function updateRangeDisplay(rangeId) {
+        const range = document.getElementById(rangeId);
+        const display = document.getElementById(rangeId + "-value");
+        if (display) {
+          display.textContent = range.value;
+        }
+      }
+
+      function updatePreview() {
+        // Collect current form values
+        currentStyles.hotspot.infoButton.backgroundColor =
+          document.getElementById("info-bg-color").value;
+        currentStyles.hotspot.infoButton.textColor =
+          document.getElementById("info-text-color").value;
+        currentStyles.hotspot.infoButton.size = parseFloat(
+          document.getElementById("info-size").value
+        );
+        currentStyles.hotspot.infoButton.fontSize = parseFloat(
+          document.getElementById("info-font-size").value
+        );
+        currentStyles.hotspot.infoButton.opacity = parseFloat(
+          document.getElementById("info-opacity").value
+        );
+
+        currentStyles.hotspot.popup.backgroundColor =
+          document.getElementById("popup-bg-color").value;
+        currentStyles.hotspot.popup.textColor =
+          document.getElementById("popup-text-color").value;
+        currentStyles.hotspot.popup.opacity = parseFloat(
+          document.getElementById("popup-opacity").value
+        );
+
+        // Navigation ring
+        currentStyles.navigation.ringColor = document.getElementById(
+          "nav-ring-color"
+        ).value;
+        const navWeblinkColorEl = document.getElementById("nav-weblink-ring-color");
+        if (navWeblinkColorEl) currentStyles.navigation.weblinkRingColor = navWeblinkColorEl.value;
+        currentStyles.navigation.ringOuterRadius = parseFloat(
+          document.getElementById("nav-ring-outer").value
+        );
+        currentStyles.navigation.ringThickness = parseFloat(
+          document.getElementById("nav-ring-thickness").value
+        );
+
+        // Navigation label
+        currentStyles.navigation.labelBackgroundColor = document.getElementById('nav-label-bg-color').value;
+        currentStyles.navigation.labelColor = document.getElementById('nav-label-text-color').value;
+        currentStyles.navigation.labelOpacity = parseFloat(document.getElementById('nav-label-opacity').value);
+
+        // Image hotspot styles
+        if (currentStyles.image) {
+          currentStyles.image.borderColor = document.getElementById('image-border-color').value;
+          currentStyles.image.borderWidth = parseFloat(document.getElementById('image-border-width').value);
+          currentStyles.image.opacity = parseFloat(document.getElementById('image-opacity').value);
+          currentStyles.image.borderRadius = parseFloat(document.getElementById('image-border-radius').value);
+        }
+
+        // Apply to preview elements
+        applyStylesToPreview();
+      }
+
+      function applyStylesToPreview() {
+        // Update info button
+        const infoButton = document.getElementById("demo-info-button");
+        if (infoButton) {
+          infoButton.setAttribute(
+            "geometry",
+            `primitive: circle; radius: ${currentStyles.hotspot.infoButton.size}`
+          );
+          infoButton.setAttribute(
+            "material",
+            `color: ${currentStyles.hotspot.infoButton.backgroundColor}; opacity: ${currentStyles.hotspot.infoButton.opacity}`
+          );
+          infoButton.setAttribute("text", {
+            value: "i",
+            align: "center",
+            color: currentStyles.hotspot.infoButton.textColor,
+            width: currentStyles.hotspot.infoButton.fontSize,
+          });
+        }
+
+        // Update popup
+        const popupBg = document.getElementById("demo-popup-bg");
+        if (popupBg) {
+          popupBg.setAttribute(
+            "color",
+            currentStyles.hotspot.popup.backgroundColor
+          );
+          popupBg.setAttribute("opacity", currentStyles.hotspot.popup.opacity);
+        }
+
+        const popupText = document.getElementById("demo-popup-text");
+        if (popupText) {
+          popupText.setAttribute(
+            "color",
+            currentStyles.hotspot.popup.textColor
+          );
+        }
+
+        const closeBtn = document.getElementById("demo-close-btn");
+        if (closeBtn) {
+          closeBtn.setAttribute(
+            "width",
+            currentStyles.hotspot.closeButton.size
+          );
+          closeBtn.setAttribute(
+            "height",
+            currentStyles.hotspot.closeButton.size
+          );
+          closeBtn.setAttribute(
+            "opacity",
+            currentStyles.hotspot.closeButton.opacity
+          );
+          // Position close button at top-right corner of popup (using fixed popup size)
+          const closeX = 4 / 2 - 0.2; // 4 is default popup width
+          const closeY = 2.5 / 2 - 0.2; // 2.5 is default popup height
+          closeBtn.setAttribute("position", `${closeX} ${closeY} 0.02`);
+        }
+
+        // Update navigation ring demo
+        const navRing = document.getElementById("demo-nav-ring");
+        const navPreview = document.getElementById("demo-nav-preview");
+        const navCollider = document.getElementById("demo-nav-collider");
+        const wRing = document.getElementById("demo-weblink-ring");
+        const wPreview = document.getElementById("demo-weblink-preview");
+        const wCollider = document.getElementById("demo-weblink-collider");
+        if (navRing && navPreview && navCollider) {
+          const outer = currentStyles.navigation.ringOuterRadius;
+          const thickness = currentStyles.navigation.ringThickness;
+          const inner = Math.max(0.001, outer - thickness);
+          navRing.setAttribute(
+            "geometry",
+            `primitive: ring; radiusInner: ${inner}; radiusOuter: ${outer}`
+          );
+          navRing.setAttribute(
+            "material",
+            `color: ${currentStyles.navigation.ringColor}; opacity: 1; transparent: true; shader: flat`
+          );
+          navPreview.setAttribute(
+            "geometry",
+            `primitive: circle; radius: ${inner}`
+          );
+          navCollider.setAttribute(
+            "geometry",
+            `primitive: circle; radius: ${outer}`
+          );
+        }
+        if (wRing && wPreview && wCollider) {
+          const outer = currentStyles.navigation.ringOuterRadius;
+          const thickness = currentStyles.navigation.ringThickness;
+          const inner = Math.max(0.001, outer - thickness);
+          wRing.setAttribute(
+            "geometry",
+            `primitive: ring; radiusInner: ${inner}; radiusOuter: ${outer}`
+          );
+          wRing.setAttribute(
+            "material",
+            `color: ${currentStyles.navigation.weblinkRingColor || '#001f5b'}; opacity: 1; transparent: true; shader: flat`
+          );
+          wPreview.setAttribute(
+            "geometry",
+            `primitive: circle; radius: ${inner}`
+          );
+          wCollider.setAttribute(
+            "geometry",
+            `primitive: circle; radius: ${outer}`
+          );
+        }
+
+        // Update navigation label demo
+        const navLabelBg = document.getElementById("demo-nav-label-bg");
+        if (navLabelBg) {
+          navLabelBg.setAttribute(
+            'material',
+            `shader:flat; color: ${currentStyles.navigation.labelBackgroundColor}; opacity: ${currentStyles.navigation.labelOpacity}; transparent: true`
+          );
+        }
+        const navLabelText = document.getElementById("demo-nav-label-text");
+        if (navLabelText) {
+          navLabelText.setAttribute('color', currentStyles.navigation.labelColor);
+        }
+        const wLabelBg = document.getElementById("demo-weblink-label-bg");
+        if (wLabelBg) {
+          wLabelBg.setAttribute(
+            'material',
+            `shader:flat; color: ${currentStyles.navigation.labelBackgroundColor}; opacity: ${currentStyles.navigation.labelOpacity}; transparent: true`
+          );
+        }
+        const wLabelText = document.getElementById("demo-weblink-label-text");
+        if (wLabelText) {
+          wLabelText.setAttribute('color', currentStyles.navigation.labelColor);
+        }
+
+        // (Deprecated duplicate path removed; material assignment above covers color/opacity)
+
+        // Update button images
+        const playButton = document.getElementById("demo-play-button");
+        if (playButton && currentStyles.buttonImages) {
+          playButton.setAttribute("src", currentStyles.buttonImages.play);
+        }
+
+        const pauseButton = document.getElementById("demo-pause-button");
+        if (pauseButton && currentStyles.buttonImages) {
+          pauseButton.setAttribute("src", currentStyles.buttonImages.pause);
+        }
+
+        // Image hotspot preview update
+        const demoImage = document.getElementById('demo-image-hotspot');
+        if (demoImage && currentStyles.image) {
+          const img = demoImage.querySelector('.demo-image');
+          const frame = demoImage.querySelector('.demo-image-border');
+          const istyle = currentStyles.image;
+          const baseW = 2.5;
+          const baseH = 1.5;
+          if (img) {
+            img.setAttribute('material', `opacity: ${istyle.opacity}; transparent: ${istyle.opacity < 1 ? 'true':'false'}; side: double; shader:flat; alphaTest:0.01`);
+            img.setAttribute('width', baseW);
+            img.setAttribute('height', baseH);
+            img.setAttribute('position', `0 ${baseH/2} 0.05`);
+            if (istyle.borderRadius && istyle.borderRadius > 0) {
+              const rawSrc = './images/newhouse.jpg';
+              clearTimeout(window.__demoImgMaskTimer);
+              window.__demoImgMaskTimer = setTimeout(()=>{
+                const baseImg = new Image();
+                baseImg.crossOrigin = 'anonymous';
+                baseImg.onload = () => {
+                  try {
+                    const w = baseImg.naturalWidth || 1024;
+                    const h = baseImg.naturalHeight || 512;
+                    const canvas = document.createElement('canvas');
+                    canvas.width = w; canvas.height = h;
+                    const ctx = canvas.getContext('2d');
+                    ctx.clearRect(0,0,w,h);
+                    const r = Math.max(0, Math.min(w/2, istyle.borderRadius * w));
+                    ctx.beginPath();
+                    ctx.moveTo(r,0); ctx.lineTo(w-r,0); ctx.quadraticCurveTo(w,0,w,r);
+                    ctx.lineTo(w,h-r); ctx.quadraticCurveTo(w,h,w-r,h);
+                    ctx.lineTo(r,h); ctx.quadraticCurveTo(0,h,0,h-r);
+                    ctx.lineTo(0,r); ctx.quadraticCurveTo(0,0,r,0); ctx.closePath();
+                    ctx.clip();
+                    ctx.drawImage(baseImg,0,0,w,h);
+                    if (istyle.borderWidth > 0) {
+                      ctx.lineWidth = istyle.borderWidth * w * 2;
+                      ctx.strokeStyle = istyle.borderColor || '#FFFFFF';
+                      ctx.stroke();
+                    }
+                    img.setAttribute('src', canvas.toDataURL('image/png'));
+                  } catch(e) {}
+                };
+                baseImg.onerror = () => {
+                  // Fallback if newhouse.jpg not present
+                  baseImg.src = './images/scene1.jpg';
+                };
+                baseImg.src = rawSrc;
+              }, 100);
+            } else {
+              img.setAttribute('src','./images/newhouse.jpg');
+            }
+          }
+          if (frame) {
+            if (istyle.borderWidth > 0 && (!istyle.borderRadius || istyle.borderRadius <= 0)) {
+              frame.setAttribute('visible','true');
+              frame.setAttribute('color', istyle.borderColor || '#FFFFFF');
+              frame.setAttribute('width', baseW + (istyle.borderWidth * 2));
+              frame.setAttribute('height', baseH + (istyle.borderWidth * 2));
+              frame.setAttribute('position', `0 ${baseH/2} 0.0`);
+              frame.setAttribute('material', `opacity:${istyle.opacity}; transparent:${istyle.opacity < 1 ? 'true':'false'}; side: double; shader:flat`);
+            } else {
+              frame.setAttribute('visible','false');
+            }
+          }
+        }
+      }
+
+      // File to base64 conversion utility
+      function fileToBase64(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.readAsDataURL(file);
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = (error) => reject(error);
+        });
+      }
+
+      // Removed portal image functions: portal visuals are ring-based at runtime
+
+      // Play image functions
+      function uploadPlayImage() {
+        document.getElementById("play-image-upload").click();
+      }
+
+      async function handlePlayImageUpload() {
+        const fileInput = document.getElementById("play-image-upload");
+        const urlInput = document.getElementById("play-image-url");
+
+        if (fileInput.files && fileInput.files[0]) {
+          try {
+            const base64 = await fileToBase64(fileInput.files[0]);
+            currentStyles.buttonImages.play = base64;
+            urlInput.value = ""; // Clear URL input
+            updatePreview();
+          } catch (error) {
+            console.error("Error uploading play image:", error);
+          }
+        }
+      }
+
+      function updatePlayImageFromURL() {
+        const urlInput = document.getElementById("play-image-url");
+        const fileInput = document.getElementById("play-image-upload");
+
+        if (urlInput.value.trim()) {
+          currentStyles.buttonImages.play = urlInput.value.trim();
+          fileInput.value = ""; // Clear file input
+          updatePreview();
+        }
+      }
+
+      function resetPlayImage() {
+        const urlInput = document.getElementById("play-image-url");
+        const fileInput = document.getElementById("play-image-upload");
+
+        currentStyles.buttonImages.play = "images/play.png";
+        urlInput.value = "";
+        fileInput.value = "";
+        updatePreview();
+      }
+
+      // Pause image functions
+      function uploadPauseImage() {
+        document.getElementById("pause-image-upload").click();
+      }
+
+      async function handlePauseImageUpload() {
+        const fileInput = document.getElementById("pause-image-upload");
+        const urlInput = document.getElementById("pause-image-url");
+
+        if (fileInput.files && fileInput.files[0]) {
+          try {
+            const base64 = await fileToBase64(fileInput.files[0]);
+            currentStyles.buttonImages.pause = base64;
+            urlInput.value = ""; // Clear URL input
+            updatePreview();
+          } catch (error) {
+            console.error("Error uploading pause image:", error);
+          }
+        }
+      }
+
+      function updatePauseImageFromURL() {
+        const urlInput = document.getElementById("pause-image-url");
+        const fileInput = document.getElementById("pause-image-upload");
+
+        if (urlInput.value.trim()) {
+          currentStyles.buttonImages.pause = urlInput.value.trim();
+          fileInput.value = ""; // Clear file input
+          updatePreview();
+        }
+      }
+
+      function resetPauseImage() {
+        const urlInput = document.getElementById("pause-image-url");
+        const fileInput = document.getElementById("pause-image-upload");
+
+        currentStyles.buttonImages.pause = "images/pause.png";
+        urlInput.value = "";
+        fileInput.value = "";
+        updatePreview();
+      }
+
+      function resetToDefaults() {
+        currentStyles = {
+          hotspot: {
+            infoButton: {
+              backgroundColor: "#00FF00",
+              textColor: "#000000",
+              text: "click for info",
+              fontSize: 8,
+              opacity: 1.0,
+            },
+            popup: {
+              backgroundColor: "#333333",
+              textColor: "#FFFFFF",
+              borderWidth: 0,
+              borderRadius: 0,
+              opacity: 0.95,
+              fontSize: 1,
+              padding: 0.2,
+            },
+            closeButton: {
+              size: 0.4,
+              opacity: 1.0,
+            },
+          },
+          navigation: {
+            labelColor: "#FFFFFF",
+            labelBackgroundColor: "#000000",
+            labelOpacity: 0.8,
+            ringColor: "#005500",
+            weblinkRingColor: "#001f5b",
+            ringOuterRadius: 0.6,
+            ringThickness: 0.08,
+          },
+          buttonImages: {
+            play: "images/play.png",
+            pause: "images/pause.png",
+          },
+          image: {
+            borderColor: "#FFFFFF",
+            borderWidth: 0.02,
+            opacity: 1.0,
+            borderRadius: 0.05,
+          },
+        };
+
+        updateFormValues();
+        updatePreview();
+      }
+
+      function saveAndReturn() {
+        // Save to localStorage
+        localStorage.setItem(
+          "vr-hotspot-css-styles",
+          JSON.stringify(currentStyles)
+        );
+        console.log("✅ Style Editor - Saved styles to localStorage");
+
+        // Return to main page with simple flag (avoid URL length issues)
+        window.location.href = "index.html?stylesUpdated=true";
+      }
+
+      function returnWithoutSaving() {
+        window.location.href = "index.html";
+      }
+
+      // Initialize when page loads
+      document.addEventListener("DOMContentLoaded", function () {
+        loadCurrentStyles();
+
+        // Add click handlers for demo popup
+        const infoButton = document.getElementById("demo-info-button");
+        const popup = document.getElementById("demo-popup");
+        const closeBtn = document.getElementById("demo-close-btn");
+
+        if (infoButton && popup && closeBtn) {
+          infoButton.addEventListener("click", () => {
+            popup.setAttribute("visible", "true");
+          });
+
+          closeBtn.addEventListener("click", () => {
+            popup.setAttribute("visible", "false");
+          });
+        }
+
+        // Panorama fallback if newhouse.jpg missing
+        const pano = document.getElementById('preview-panorama');
+        if (pano) {
+          pano.addEventListener('error', () => {
+            console.warn('newhouse.jpg not found in ./images, falling back to scene1.jpg');
+            pano.src = './images/scene1.jpg';
+          });
+        }
+      });
+
+      function toggleInstructions() {
+        const content = document.getElementById("instructions-content");
+        const toggle = document.getElementById("instructions-toggle");
+        
+        if (content && toggle) {
+          content.classList.toggle("collapsed");
+          toggle.classList.toggle("collapsed");
+        }
+      }
+    </script>
+  </body>
+</html>
