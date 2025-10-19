@@ -11,7 +11,3 @@ services:
         value: production
     healthCheckPath: /
     autoDeploy: true
-    disk:
-      name: vr-hotspots-storage
-      mountPath: /opt/render/project
-      sizeGB: 1
