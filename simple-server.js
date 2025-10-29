@@ -11,12 +11,36 @@ const archiver = require("archiver");
 const app = express();
 const upload = multer({ dest: "student-projects/" });
 
-// Serve the VR editor
-app.use(express.static("."));
+// Serve the VR editor with cache-busting headers so students always get updates
+const staticNoStaleOptions = {
+  setHeaders: (res, filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    // Never cache HTML; always fetch latest shell
+    if (ext === ".html" || ext === ".htm") {
+      res.setHeader("Cache-Control", "no-store");
+      return;
+    }
+    // For app code and configs, force revalidation each load
+    if (ext === ".js" || ext === ".css" || ext === ".json") {
+      res.setHeader("Cache-Control", "no-cache, must-revalidate");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      return;
+    }
+    // Media and images: revalidate so changed files get fetched without manual clears
+    if ([".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".mp3", ".wav", ".ogg", ".mp4", ".webm"].includes(ext)) {
+      res.setHeader("Cache-Control", "no-cache, must-revalidate");
+      return;
+    }
+    // Default: conservative no-cache
+    res.setHeader("Cache-Control", "no-cache");
+  }
+};
+app.use(express.static(".", staticNoStaleOptions));
 app.use(express.json());
 
-// Serve hosted student projects
-app.use("/hosted", express.static("hosted-projects"));
+// Serve hosted student projects with the same anti-stale headers
+app.use("/hosted", express.static("hosted-projects", staticNoStaleOptions));
 
 // Collect student project submissions
 app.post("/submit-project", upload.single("project"), (req, res) => {
@@ -47,6 +71,94 @@ app.post("/submit-project", upload.single("project"), (req, res) => {
     success: true,
     message: "Project submitted successfully!",
     fileName,
+  });
+});
+
+// Server-side video fetch endpoint (bypasses CORS)
+app.post("/fetch-video", express.json(), async (req, res) => {
+  const { url } = req.body;
+
+  // Validate URL
+  if (!url || (!url.startsWith("http://") && !url.startsWith("https://"))) {
+    return res.status(400).json({ 
+      success: false, 
+      error: "Invalid URL. Must be http or https." 
+    });
+  }
+
+  // Prevent localhost/private IP abuse
+  try {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.toLowerCase();
+    
+    if (hostname === "localhost" || 
+        hostname === "127.0.0.1" || 
+        hostname.startsWith("192.168.") || 
+        hostname.startsWith("10.") || 
+        hostname.startsWith("172.")) {
+      return res.status(403).json({ 
+        success: false, 
+        error: "Cannot fetch from private/local addresses." 
+      });
+    }
+  } catch (e) {
+    return res.status(400).json({ 
+      success: false, 
+      error: "Invalid URL format." 
+    });
+  }
+
+  console.log(`📹 Fetching video from: ${url}`);
+
+  const protocol = url.startsWith("https") ? https : require("http");
+
+  protocol.get(url, { timeout: 60000 }, (videoRes) => {
+    // Check response status
+    if (videoRes.statusCode !== 200) {
+      return res.status(videoRes.statusCode).json({ 
+        success: false, 
+        error: `Remote server returned ${videoRes.statusCode}` 
+      });
+    }
+
+    // Set headers
+    const contentType = videoRes.headers["content-type"] || "video/mp4";
+    const contentLength = videoRes.headers["content-length"];
+
+    // Check file size (limit to 500MB)
+    if (contentLength && parseInt(contentLength) > 500 * 1024 * 1024) {
+      videoRes.destroy();
+      return res.status(413).json({ 
+        success: false, 
+        error: "Video file too large (max 500MB)." 
+      });
+    }
+
+    res.setHeader("Content-Type", contentType);
+    if (contentLength) {
+      res.setHeader("Content-Length", contentLength);
+    }
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    // Stream video directly to client
+    videoRes.pipe(res);
+
+    videoRes.on("error", (err) => {
+      console.error("Video fetch error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ 
+          success: false, 
+          error: "Failed to fetch video." 
+        });
+      }
+    });
+
+  }).on("error", (err) => {
+    console.error("Video fetch error:", err);
+    res.status(500).json({ 
+      success: false, 
+      error: `Network error: ${err.message}` 
+    });
   });
 });
 

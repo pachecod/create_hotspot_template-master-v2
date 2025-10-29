@@ -471,157 +471,118 @@
           Opens style editor with live preview
         </div>
       </div>
-      <!-- Scene Management -->
+      <!-- Mode -->
       <div class="panel-section">
-        <div class="section-title">Scene Management</div>
+        <div class="section-title">Mode</div>
         <div class="form-group">
-          <label for="current-scene">Current Scene:</label>
-          <select
-            id="current-scene"
-            style="
-              width: 100%;
-              padding: 8px;
-              background: #333;
-              color: white;
-              border: 1px solid #555;
-              border-radius: 4px;
-            "
-          >
-            <option value="scene1">Scene 1</option>
-          </select>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <div id="edit-mode-switch" role="switch" aria-checked="true" tabindex="0"
+                 style="width:52px; height:28px; background:#4caf50; border-radius:14px; position:relative; cursor:pointer; transition:background 160ms ease; outline:none;">
+              <div class="thumb" style="position:absolute; top:2px; left:26px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left 160ms ease;"></div>
+            </div>
+            <div style="flex:1; min-width:0;">
+              <div id="edit-mode-label" style="font-weight:700; color:#e0e0e0;">🛠️ Edit Mode: ON</div>
+              <small id="edit-mode-help" style="color:#888; font-size:11px;">Click to switch to Navigation Mode</small>
+            </div>
+          </div>
+          <!-- Hidden native toggle retained for logic bindings -->
+          <input type="checkbox" id="edit-mode-toggle" checked style="display: none" />
         </div>
-        <div style="display: flex; gap: 5px">
-          <button class="btn btn-secondary" id="add-scene" style="flex: 1">
-            Add Scene
-          </button>
-          <button class="btn btn-secondary" id="manage-scenes" style="flex: 1">
-            Manage
-          </button>
-        </div>
-        <div class="form-group">
-          <label>
-            <input
-              type="checkbox"
-              id="edit-mode-toggle"
-              checked
-              style="margin-right: 8px"
-            />
-            Edit Mode (uncheck to navigate)
-          </label>
-        </div>
+      </div>
 
-        <!-- Global Scene Sound Controls -->
-        <div
-          class="form-group"
-          style="
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #555;
-          "
-        >
-          <label style="margin-bottom: 10px; color: #ff9800; font-weight: bold">
-            🎵 Global Scene Sound
-          </label>
+      <!-- Global Scene Sound -->
+      <div class="panel-section">
+        <div class="section-title">Global Scene Sound</div>
+        <div class="form-group">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <div id="global-sound-switch" role="switch" aria-checked="false" tabindex="0"
+                 style="width:52px; height:28px; background:#777; border-radius:14px; position:relative; cursor:pointer; transition:background 160ms ease; outline:none;">
+              <div class="thumb" style="position:absolute; top:2px; left:2px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left 160ms ease;"></div>
+            </div>
+            <div style="flex:1; min-width:0;">
+              <div id="global-sound-label" style="font-weight:700; color:#e0e0e0;">🔇 Scene Audio: OFF</div>
+              <small id="global-sound-help" style="color:#888; font-size:11px;">Click to enable ambient sound for this scene</small>
+            </div>
+          </div>
+          <!-- Hidden native toggle retained for logic bindings -->
+          <input type="checkbox" id="global-sound-enabled" style="display:none" />
+        </div>
+        <div id="global-sound-controls" style="display: none">
           <div class="form-group">
-            <label>
-              <input
-                type="checkbox"
-                id="global-sound-enabled"
-                style="margin-right: 8px"
-              />
-              Add global sound to Scene
-            </label>
+            <label for="global-sound-file">Audio File:</label>
+            <input type="file" id="global-sound-file" accept="audio/*" />
           </div>
-          <div id="global-sound-controls" style="display: none">
-            <div class="form-group">
-              <label for="global-sound-file">Audio File:</label>
-              <input type="file" id="global-sound-file" accept="audio/*" />
-            </div>
-            <div class="form-group">
-              <label for="global-sound-url">Or Audio URL:</label>
-              <input
-                type="url"
-                id="global-sound-url"
-                placeholder="https://example.com/ambient.mp3"
-                style="
-                  width: 100%;
-                  padding: 10px;
-                  border: 1px solid #555;
-                  border-radius: 4px;
-                  background: #333;
-                  color: white;
-                  box-sizing: border-box;
-                "
-              />
-              <small style="color: #888; font-size: 11px">
-                Enter a direct URL to an audio file for ambient Scene sound
-              </small>
-            </div>
-            <div class="form-group">
-              <label for="global-sound-volume">Volume:</label>
-              <input
-                type="range"
-                id="global-sound-volume"
-                min="0"
-                max="1"
-                step="0.1"
-                value="0.5"
-                style="width: 100%"
-              />
-              <small style="color: #888; font-size: 11px">
-                Volume level (0.0 - 1.0)
-              </small>
-            </div>
+          <div class="form-group">
+            <label for="global-sound-url">Or Audio URL:</label>
+            <input
+              type="url"
+              id="global-sound-url"
+              placeholder="https://example.com/ambient.mp3"
+              style="
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #333;
+                color: white;
+                box-sizing: border-box;
+              "
+            />
+            <small style="color: #888; font-size: 11px">
+              Enter a direct URL to an audio file for ambient Scene sound
+            </small>
           </div>
-        </div>
-
-        <!-- Starting Point Controls -->
-        <div
-          class="form-group"
-          style="
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #555;
-          "
-        >
-          <label style="margin-bottom: 10px; color: #4caf50; font-weight: bold">
-            📍 Starting Point Controls
-          </label>
-          <div style="display: flex; gap: 5px; margin-bottom: 10px">
-            <button
-              class="btn btn-secondary"
-              id="set-starting-point"
-              style="flex: 1; font-size: 12px"
-            >
-              Set Current View
-            </button>
-            <button
-              class="btn btn-secondary"
-              id="clear-starting-point"
-              style="flex: 1; font-size: 12px"
-            >
-              Clear
-            </button>
-          </div>
-          <div
-            id="starting-point-info"
-            style="
-              font-size: 11px;
-              color: #ccc;
-              text-align: center;
-              padding: 8px;
-              background: #333;
-              border-radius: 4px;
-            "
-          >
-            No starting point set
+          <div class="form-group">
+            <label for="global-sound-volume">Volume:</label>
+            <input
+              type="range"
+              id="global-sound-volume"
+              min="0"
+              max="1"
+              step="0.1"
+              value="0.5"
+              style="width: 100%"
+            />
+            <small style="color: #888; font-size: 11px">
+              Volume level (0.0 - 1.0)
+            </small>
           </div>
         </div>
       </div>
 
-      <!-- Hotspot Type Selection -->
+      <!-- Scene Management -->
       <div class="panel-section">
-        <div class="section-title">Hotspot Type</div>
+        <div class="section-title">Scene Management</div>
+        <!-- Starting Point Controls -->
+        <div class="form-group" style="margin-top: 0; padding-top: 0; border-top: none;">
+          <label style="margin-bottom: 10px; color: #4caf50; font-weight: bold">
+            📍 Starting Point Controls
+          </label>
+          <div style="display: flex; gap: 5px; margin-bottom: 10px">
+            <button class="btn btn-secondary" id="set-starting-point" style="flex: 1; font-size: 12px">Set Current View</button>
+            <button class="btn btn-secondary" id="clear-starting-point" style="flex: 1; font-size: 12px">Clear</button>
+          </div>
+          <div id="starting-point-info" style="font-size: 11px; color: #ccc; text-align: center; padding: 8px; background: #333; border-radius: 4px;">
+            No starting point set
+          </div>
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+          <label for="current-scene">Current Scene:</label>
+          <select id="current-scene" style="width: 100%; padding: 8px; background: #333; color: white; border: 1px solid #555; border-radius: 4px;">
+            <option value="scene1">Scene 1</option>
+          </select>
+        </div>
+        <div style="display: flex; gap: 5px">
+          <button class="btn btn-secondary" id="add-scene" style="flex: 1">Add Scene</button>
+          <button class="btn btn-secondary" id="manage-scenes" style="flex: 1">Manage</button>
+        </div>
+      </div>
+
+      <!-- Hotspot Type Selection -->
+      <div class="panel-section" id="hotspot-type-section">
+        <div class="section-title" id="hotspot-type-title" style="cursor: pointer; user-select: none;">
+          Hotspot Type <span id="hotspot-type-caret" style="opacity:0.8; font-size:12px; margin-left:6px;">▼</span>
+        </div>
         <div class="hotspot-type selected" data-type="text">
           <input type="radio" name="hotspot-type" value="text" checked />
           <span>📝 Text Popup Only</span>
@@ -646,187 +607,187 @@
           <input type="radio" name="hotspot-type" value="image" />
           <span>🖼️ Image</span>
         </div>
-      </div>
 
-      <!-- Hotspot Properties -->
-      <div class="panel-section">
-        <div class="section-title">Hotspot Properties</div>
-        <div class="form-group">
-          <label for="hotspot-text">Text Content:</label>
-          <textarea
-            id="hotspot-text"
-            placeholder="Enter popup text content"
-          ></textarea>
-        </div>
-        <div class="form-group">
-          <label for="hotspot-audio">Audio File:</label>
-          <input type="file" id="hotspot-audio" accept="audio/*" />
-        </div>
-        <div class="form-group">
-          <label for="hotspot-audio-url">Or Audio URL:</label>
-          <input
-            type="url"
-            id="hotspot-audio-url"
-            placeholder="https://example.com/audio.mp3"
-            style="
-              width: 100%;
-              padding: 10px;
-              border: 1px solid #555;
-              border-radius: 4px;
-              background: #333;
-              color: white;
-              box-sizing: border-box;
-            "
-          />
-          <small style="color: #888; font-size: 11px">
-            Enter a direct URL to an audio file (mp3, wav, ogg)
-          </small>
-        </div>
-        <div
-          class="form-group"
-          id="navigation-target-group"
-          style="display: none"
-        >
-          <label for="navigation-target">Target Scene:</label>
-          <select
-            id="navigation-target"
-            style="
-              width: 100%;
-              padding: 8px;
-              background: #333;
-              color: white;
-              border: 1px solid #555;
-              border-radius: 4px;
-            "
-          >
-            <option value="">Select target scene...</option>
-          </select>
-        </div>
-        <!-- Image hotspot specific fields -->
-        <div class="form-group" id="image-file-group" style="display: none">
-          <label for="hotspot-image-file">Image File:</label>
-          <input type="file" id="hotspot-image-file" accept="image/*" />
-        </div>
-        <div class="form-group" id="image-url-group" style="display: none">
-          <label for="hotspot-image-url">Or Image URL:</label>
-          <input
-            type="url"
-            id="hotspot-image-url"
-            placeholder="https://example.com/image.png"
-            style="
-              width: 100%;
-              padding: 10px;
-              border: 1px solid #555;
-              border-radius: 4px;
-              background: #333;
-              color: white;
-              box-sizing: border-box;
-            "
-          />
-          <small style="color: #888; font-size: 11px"
-            >Provide an image file or URL (png, jpg, gif). One is
-            required.</small
-          >
-        </div>
-        <div class="form-group" id="image-size-group" style="display: none">
-          <label style="font-size: 12px; color: #ccc"
-            >Scale
+        <!-- Hotspot Properties merged into this section -->
+        <div id="hotspot-properties-group" style="margin-top: 10px;">
+          <div class="section-title" style="margin-top: 10px;">Hotspot Properties</div>
+          <div class="form-group">
+            <label for="hotspot-text">Text Content:</label>
+            <textarea
+              id="hotspot-text"
+              placeholder="Enter popup text content"
+            ></textarea>
+          </div>
+          <div class="form-group">
+            <label for="hotspot-audio">Audio File:</label>
+            <input type="file" id="hotspot-audio" accept="audio/*" />
+          </div>
+          <div class="form-group">
+            <label for="hotspot-audio-url">Or Audio URL:</label>
             <input
-              type="number"
-              id="hotspot-image-scale"
-              min="0.1"
-              max="10"
-              step="0.1"
-              value="1"
+              type="url"
+              id="hotspot-audio-url"
+              placeholder="https://example.com/audio.mp3"
+              style="
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #333;
+                color: white;
+                box-sizing: border-box;
+              "
+            />
+            <small style="color: #888; font-size: 11px">
+              Enter a direct URL to an audio file (mp3, wav, ogg)
+            </small>
+          </div>
+          <div
+            class="form-group"
+            id="navigation-target-group"
+            style="display: none"
+          >
+            <label for="navigation-target">Target Scene:</label>
+            <select
+              id="navigation-target"
               style="
                 width: 100%;
                 padding: 8px;
-                border-radius: 4px;
-                border: 1px solid #555;
                 background: #333;
-                color: #fff;
+                color: white;
+                border: 1px solid #555;
+                border-radius: 4px;
+              "
+            >
+              <option value="">Select target scene...</option>
+            </select>
+          </div>
+          <!-- Image hotspot specific fields -->
+          <div class="form-group" id="image-file-group" style="display: none">
+            <label for="hotspot-image-file">Image File:</label>
+            <input type="file" id="hotspot-image-file" accept="image/*" />
+          </div>
+          <div class="form-group" id="image-url-group" style="display: none">
+            <label for="hotspot-image-url">Or Image URL:</label>
+            <input
+              type="url"
+              id="hotspot-image-url"
+              placeholder="https://example.com/image.png"
+              style="
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #333;
+                color: white;
+                box-sizing: border-box;
               "
             />
-          </label>
-          <small style="color: #888; font-size: 11px"
-            >Scales the image uniformly. Aspect ratio preserved from original
-            image.</small
-          >
-        </div>
+            <small style="color: #888; font-size: 11px"
+              >Provide an image file or URL (png, jpg, gif). One is
+              required.</small
+            >
+          </div>
+          <div class="form-group" id="image-size-group" style="display: none">
+            <label style="font-size: 12px; color: #ccc"
+              >Scale
+              <input
+                type="number"
+                id="hotspot-image-scale"
+                min="0.1"
+                max="10"
+                step="0.1"
+                value="1"
+                style="
+                  width: 100%;
+                  padding: 8px;
+                  border-radius: 4px;
+                  border: 1px solid #555;
+                  background: #333;
+                  color: #fff;
+                "
+              />
+            </label>
+            <small style="color: #888; font-size: 11px"
+              >Scales the image uniformly. Aspect ratio preserved from original
+              image.</small
+            >
+          </div>
 
-        <!-- Weblink portal specific fields -->
-        <div class="form-group" id="weblink-url-group" style="display: none">
-          <label for="weblink-url">Link URL:</label>
-          <input
-            type="url"
-            id="weblink-url"
-            placeholder="https://example.com"
-            style="
-              width: 100%;
-              padding: 10px;
-              border: 1px solid #555;
-              border-radius: 4px;
-              background: #333;
-              color: white;
-              box-sizing: border-box;
-            "
-          />
-          <small style="color: #888; font-size: 11px"
-            >Provide a full URL starting with http:// or https://</small
+          <!-- Weblink portal specific fields -->
+          <div class="form-group" id="weblink-url-group" style="display: none">
+            <label for="weblink-url">Link URL:</label>
+            <input
+              type="url"
+              id="weblink-url"
+              placeholder="https://example.com"
+              style="
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #333;
+                color: white;
+                box-sizing: border-box;
+              "
+            />
+            <small style="color: #888; font-size: 11px"
+              >Provide a full URL starting with http:// or https://</small
+            >
+          </div>
+          <div class="form-group" id="weblink-title-group" style="display: none">
+            <label for="weblink-title">Link Title (optional):</label>
+            <input
+              type="text"
+              id="weblink-title"
+              placeholder="e.g., GitHub"
+              style="
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #333;
+                color: white;
+                box-sizing: border-box;
+              "
+            />
+          </div>
+          <div
+            class="form-group"
+            id="weblink-image-file-group"
+            style="display: none"
           >
-        </div>
-        <div class="form-group" id="weblink-title-group" style="display: none">
-          <label for="weblink-title">Link Title (optional):</label>
-          <input
-            type="text"
-            id="weblink-title"
-            placeholder="e.g., GitHub"
-            style="
-              width: 100%;
-              padding: 10px;
-              border: 1px solid #555;
-              border-radius: 4px;
-              background: #333;
-              color: white;
-              box-sizing: border-box;
-            "
-          />
-        </div>
-        <div
-          class="form-group"
-          id="weblink-image-file-group"
-          style="display: none"
-        >
-          <label for="weblink-image-file"
-            >Portal Preview Image (optional):</label
+            <label for="weblink-image-file"
+              >Portal Preview Image (optional):</label
+            >
+            <input type="file" id="weblink-image-file" accept="image/*" />
+          </div>
+          <div
+            class="form-group"
+            id="weblink-image-url-group"
+            style="display: none"
           >
-          <input type="file" id="weblink-image-file" accept="image/*" />
+            <label for="weblink-image-url">Or Preview Image URL:</label>
+            <input
+              type="url"
+              id="weblink-image-url"
+              placeholder="https://example.com/preview.jpg"
+              style="
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #333;
+                color: white;
+                box-sizing: border-box;
+              "
+            />
+            <small style="color: #888; font-size: 11px"
+              >Optional image shown inside the ring on hover.</small
+            >
+          </div>
+          <button class="btn btn-primary" id="add-hotspot">Add Hotspot</button>
         </div>
-        <div
-          class="form-group"
-          id="weblink-image-url-group"
-          style="display: none"
-        >
-          <label for="weblink-image-url">Or Preview Image URL:</label>
-          <input
-            type="url"
-            id="weblink-image-url"
-            placeholder="https://example.com/preview.jpg"
-            style="
-              width: 100%;
-              padding: 10px;
-              border: 1px solid #555;
-              border-radius: 4px;
-              background: #333;
-              color: white;
-              box-sizing: border-box;
-            "
-          />
-          <small style="color: #888; font-size: 11px"
-            >Optional image shown inside the ring on hover.</small
-          >
-        </div>
-        <button class="btn btn-primary" id="add-hotspot">Add Hotspot</button>
       </div>
 
       <!-- Existing Hotspots -->
@@ -905,9 +866,6 @@
       <a-assets>
         <!-- Default panorama image -->
         <img id="main-panorama" src="./images/scene1.jpg" />
-        <!-- Hotspot icons -->
-        <img id="hotspot" src="./images/up-arrow.png" />
-        <img id="dot" src="./images/dot.png" />
         <!-- Default audio file -->
         <audio id="default-audio" src="./audio/music.mp3"></audio>
         <!-- Close icon -->
@@ -915,6 +873,8 @@
         <!-- Audio controls -->
         <img id="play" src="./images/play.png" />
         <img id="pause" src="./images/pause.png" />
+        <!-- Video assets for 360° video scenes -->
+        <video id="scene-video-dynamic" crossorigin="anonymous" loop muted playsinline webkit-playsinline style="display:none"></video>
       </a-assets>
 
       <!-- Container for hotspots -->
@@ -977,5 +937,58 @@
         }
       }
     </script>
+
+    <!-- Video Controls (appears only for video scenes) -->
+    <div id="video-controls" style="
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.8);
+      padding: 15px 25px;
+      border-radius: 30px;
+      display: none;
+      gap: 15px;
+      align-items: center;
+      z-index: 1001;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+    ">
+      <button id="video-play-pause" style="
+        background: #007bff;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 20px;
+        cursor: pointer;
+        font-size: 16px;
+        font-weight: bold;
+      ">⏸ Pause</button>
+      
+      <button id="video-mute" style="
+        background: #28a745;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 20px;
+        cursor: pointer;
+        font-size: 16px;
+      ">🔇 Muted</button>
+      
+      <div style="color: white; font-size: 14px;">
+        <span id="video-time-current">0:00</span> / <span id="video-time-total">0:00</span>
+      </div>
+      
+      <input type="range" id="video-progress" min="0" max="100" value="0" style="
+        width: 200px;
+        height: 6px;
+        cursor: pointer;
+      ">
+      
+      <input type="range" id="video-volume" min="0" max="100" value="50" style="
+        width: 100px;
+        height: 6px;
+        cursor: pointer;
+      " title="Volume">
+    </div>
   </body>
 </html>

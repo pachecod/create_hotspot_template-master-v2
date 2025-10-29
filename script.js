@@ -1,12 +1,18 @@
-// Face camera component with cached camera
+// Face camera component with robust camera resolution and world-space alignment
 AFRAME.registerComponent("face-camera", {
   init: function () {
-    this.cameraObj = document.querySelector("[camera]").object3D;
+    this._tmp = new THREE.Vector3();
+    this._cameraEl = null;
   },
   tick: function () {
-    if (this.cameraObj) {
-      this.el.object3D.lookAt(this.cameraObj.position);
+    // Resolve camera lazily in case it isn't ready at init
+    if (!this._cameraEl || !this._cameraEl.object3D) {
+      this._cameraEl = document.querySelector("[camera]") || document.getElementById("cam");
+      if (!this._cameraEl || !this._cameraEl.object3D) return;
     }
+    // Use world position to avoid parent transform discrepancies
+    this._cameraEl.object3D.getWorldPosition(this._tmp);
+    this.el.object3D.lookAt(this._tmp);
   },
 });
 
@@ -128,7 +134,10 @@ class HotspotEditor {
     this.scenes = {
       scene1: {
         name: "Scene 1",
+        type: "image", // NEW: "image" or "video"
         image: "./images/scene1.jpg",
+        videoSrc: null, // NEW: video source for video scenes
+        videoVolume: 0.5, // NEW: 0-1 volume control
         hotspots: [],
         startingPoint: null, // { rotation: { x: 0, y: 0, z: 0 } }
         globalSound: null, // { audio: string|File, volume: number, enabled: boolean }
@@ -170,7 +179,6 @@ class HotspotEditor {
         buttonOpacity: 1.0,
       },
       buttonImages: {
-        portal: "images/up-arrow.png",
         play: "images/play.png",
         pause: "images/pause.png",
       },
@@ -199,8 +207,51 @@ class HotspotEditor {
 
     // Cache for data URLs of image Files to avoid re-encoding identical uploads
     this._imageDataURLCache = new Map();
+  this._videoPreviewCache = new Map();
 
     this.init();
+  }
+  // Generate and cache a small preview image from a video's first frame
+  async _ensureVideoPreview(sceneId) {
+    try {
+      if (this._videoPreviewCache.has(sceneId)) return this._videoPreviewCache.get(sceneId);
+      const sc = this.scenes[sceneId];
+      if (!sc || sc.type !== 'video' || !sc.videoSrc) return null;
+      // Create or reuse a hidden worker video element
+      let v = document.getElementById('video-thumb-worker');
+      if (!v) {
+        v = document.createElement('video');
+        v.id = 'video-thumb-worker';
+        v.muted = true; v.playsInline = true; v.setAttribute('webkit-playsinline','');
+        v.crossOrigin = 'anonymous'; v.preload = 'auto'; v.style.display = 'none';
+        const assets = document.querySelector('a-assets') || document.body;
+        assets.appendChild(v);
+      }
+      if (v.src !== sc.videoSrc) {
+        v.src = sc.videoSrc;
+        // Loading metadata
+        await new Promise((res, rej) => {
+          const onErr = () => { v.removeEventListener('error', onErr); res(null); };
+          v.addEventListener('loadeddata', () => res(true), { once: true });
+          v.addEventListener('error', onErr, { once: true });
+        });
+      }
+      // Try to seek a bit into the video for a stable frame
+      try {
+        v.currentTime = Math.min(1, (v.duration || 1) * 0.1);
+        await new Promise((res) => v.addEventListener('seeked', () => res(true), { once: true }));
+      } catch (_) { /* ignore */ }
+      const vw = v.videoWidth || 1024; const vh = v.videoHeight || 512;
+      const cw = 512; const ch = Math.max(1, Math.round((vh / vw) * cw));
+      const c = document.createElement('canvas'); c.width = cw; c.height = ch;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(v, 0, 0, cw, ch);
+      const url = c.toDataURL('image/png');
+      this._videoPreviewCache.set(sceneId, url);
+      return url;
+    } catch (_) {
+      return null;
+    }
   }
 
   init() {
@@ -223,7 +274,19 @@ class HotspotEditor {
     // Apply loaded styles to ensure they take effect
     this.refreshAllHotspotStyles();
 
-    this.loadCurrentScene();
+    // Try to persist storage for larger assets
+    this.requestPersistentStorage();
+
+    // Rehydrate any image/video/audio blob URLs from IndexedDB, then load the scene
+    this.rehydrateImageSourcesFromIDB()
+      .catch(() => {})
+      .then(() => this.rehydrateVideoSourcesFromIDB())
+      .catch(() => {})
+      .then(() => this.rehydrateAudioSourcesFromIDB())
+      .catch(() => {})
+      .finally(() => {
+        this.loadCurrentScene();
+      });
     
     // Prompt to change default scene image (only if still using default)
     this.promptForSceneImageChange();
@@ -233,6 +296,447 @@ class HotspotEditor {
 
     // Initialize editor sound controls
     this.updateEditorSoundButton();
+  }
+
+  // ===== IndexedDB asset storage helpers (videos + images) =====
+  openVideoDB() {
+    if (this._videoDBPromise) return this._videoDBPromise;
+    this._videoDBPromise = new Promise((resolve, reject) => {
+      if (!('indexedDB' in window)) return resolve(null);
+      // Bump DB version to 3 to add 'images' and 'audio' stores alongside 'videos'
+      const req = indexedDB.open('vr-hotspots', 3);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('videos')) {
+          db.createObjectStore('videos', { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains('images')) {
+          db.createObjectStore('images', { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains('audio')) {
+          db.createObjectStore('audio', { keyPath: 'key' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    });
+    return this._videoDBPromise;
+  }
+
+  async saveVideoToIDB(key, file) {
+    try {
+      const db = await this.openVideoDB(); if (!db) return false;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('videos', 'readwrite');
+        const store = tx.objectStore('videos');
+        const rec = { key, name: file.name, type: file.type, size: file.size, updated: Date.now(), blob: file };
+        store.put(rec);
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+      });
+    } catch (_) { return false; }
+  }
+
+  async getVideoFromIDB(key) {
+    try {
+      const db = await this.openVideoDB(); if (!db) return null;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('videos', 'readonly');
+        const store = tx.objectStore('videos');
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      });
+    } catch (_) { return null; }
+  }
+
+  async deleteVideoFromIDB(key) {
+    try {
+      const db = await this.openVideoDB(); if (!db) return false;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('videos', 'readwrite');
+        const store = tx.objectStore('videos');
+        store.delete(key);
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+      });
+    } catch (_) { return false; }
+  }
+
+  async clearAllVideosFromIDB() {
+    try {
+      const db = await this.openVideoDB(); if (!db) return false;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('videos', 'readwrite');
+        const store = tx.objectStore('videos');
+        store.clear();
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+      });
+    } catch (_) { return false; }
+  }
+
+  // ===== IndexedDB images storage helpers =====
+  async saveImageToIDB(key, fileOrBlob) {
+    try {
+      const db = await this.openVideoDB(); if (!db) return false;
+      const name = (fileOrBlob && fileOrBlob.name) ? fileOrBlob.name : 'image.png';
+      const type = (fileOrBlob && fileOrBlob.type) ? fileOrBlob.type : 'image/png';
+      const size = (fileOrBlob && fileOrBlob.size) ? fileOrBlob.size : 0;
+      const blob = fileOrBlob;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('images', 'readwrite');
+        const store = tx.objectStore('images');
+        const rec = { key, name, type, size, updated: Date.now(), blob };
+        store.put(rec);
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+      });
+    } catch (_) { return false; }
+  }
+
+  async getImageFromIDB(key) {
+    try {
+      const db = await this.openVideoDB(); if (!db) return null;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('images', 'readonly');
+        const store = tx.objectStore('images');
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      });
+    } catch (_) { return null; }
+  }
+
+  async deleteImageFromIDB(key) {
+    try {
+      const db = await this.openVideoDB(); if (!db) return false;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('images', 'readwrite');
+        const store = tx.objectStore('images');
+        store.delete(key);
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+      });
+    } catch (_) { return false; }
+  }
+
+  async clearAllImagesFromIDB() {
+    try {
+      const db = await this.openVideoDB(); if (!db) return false;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('images', 'readwrite');
+        const store = tx.objectStore('images');
+        store.clear();
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+      });
+    } catch (_) { return false; }
+  }
+
+  // ===== IndexedDB audio storage helpers =====
+  async saveAudioToIDB(key, fileOrBlob) {
+    try {
+      const db = await this.openVideoDB(); if (!db) return false;
+      const name = (fileOrBlob && fileOrBlob.name) ? fileOrBlob.name : 'audio.mp3';
+      const type = (fileOrBlob && fileOrBlob.type) ? fileOrBlob.type : 'audio/mpeg';
+      const size = (fileOrBlob && fileOrBlob.size) ? fileOrBlob.size : 0;
+      const blob = fileOrBlob;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('audio', 'readwrite');
+        const store = tx.objectStore('audio');
+        const rec = { key, name, type, size, updated: Date.now(), blob };
+        store.put(rec);
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+      });
+    } catch (_) { return false; }
+  }
+
+  async getAudioFromIDB(key) {
+    try {
+      const db = await this.openVideoDB(); if (!db) return null;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('audio', 'readonly');
+        const store = tx.objectStore('audio');
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      });
+    } catch (_) { return null; }
+  }
+
+  async clearAllAudiosFromIDB() {
+    try {
+      const db = await this.openVideoDB(); if (!db) return false;
+      return await new Promise((resolve) => {
+        const tx = db.transaction('audio', 'readwrite');
+        const store = tx.objectStore('audio');
+        store.clear();
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+      });
+    } catch (_) { return false; }
+  }
+
+  async downloadRemoteVideoToLocal(sceneId) {
+    const scene = this.scenes[sceneId];
+    if (!scene || scene.type !== "video" || !scene.videoSrc) {
+      alert("Invalid scene or not a video scene.");
+      return;
+    }
+
+    const remoteURL = scene.videoSrc;
+    if (!remoteURL.startsWith("http://") && !remoteURL.startsWith("https://")) {
+      alert("Video is already local or not a remote URL.");
+      return;
+    }
+
+    this.showLoadingIndicator("Downloading remote video...");
+
+    try {
+      // Attempt client-side fetch
+      const response = await fetch(remoteURL, { mode: "cors" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const blob = await response.blob();
+      const fileName = remoteURL.split("/").pop() || "remote-video.mp4";
+      const file = new File([blob], fileName, { type: blob.type || "video/mp4" });
+
+      // Save to IndexedDB
+      const storageKey = `video_${sceneId}`;
+      const saved = await this.saveVideoToIDB(storageKey, file);
+      if (!saved) {
+        throw new Error("Failed to save video to IndexedDB.");
+      }
+
+      // Create blob URL and update scene
+      const blobURL = URL.createObjectURL(blob);
+      scene.videoSrc = blobURL;
+      scene.videoStorageKey = storageKey;
+      
+      // Clear old preview if any
+      if (this._videoPreviewCache && this._videoPreviewCache.has(sceneId)) {
+        this._videoPreviewCache.delete(sceneId);
+      }
+
+      this.saveScenesData();
+      this.hideLoadingIndicator();
+
+      alert(`Video downloaded and saved locally!\n\nYou can now:\n• Generate thumbnails for navigation previews\n• Export this scene offline\n• Remove the original remote URL`);
+
+      // Reload scene manager to reflect "Local (IDB)" status
+      this.showSceneManager();
+
+      // Reload current scene if this is the active scene
+      if (this.currentScene === sceneId) {
+        this.loadCurrentScene();
+      }
+
+    } catch (error) {
+      this.hideLoadingIndicator();
+      console.error("Failed to download remote video:", error);
+      
+      let errorMessage = "Failed to download remote video.\n\n";
+      
+      if (error.message.includes("CORS") || error.message.includes("NetworkError") || error.name === "TypeError") {
+        errorMessage += "❌ CORS Error: The remote server doesn't allow browser downloads.\n\n";
+        errorMessage += "💡 Would you like to try downloading via the server instead?\n";
+        errorMessage += "(This bypasses CORS restrictions)";
+        
+        const tryServerDownload = confirm(errorMessage);
+        if (tryServerDownload) {
+          this.downloadRemoteVideoViaServer(sceneId, remoteURL);
+        }
+      } else {
+        errorMessage += `Error: ${error.message}\n\n`;
+        errorMessage += "The video may not be accessible or the URL may be incorrect.";
+        alert(errorMessage);
+      }
+    }
+  }
+
+  async autoDownloadRemoteVideo(sceneId, remoteURL) {
+    const scene = this.scenes[sceneId];
+    if (!scene) return;
+
+    this.showLoadingIndicator("Downloading video to local storage...");
+
+    try {
+      // Try client-side fetch first
+      const response = await fetch(remoteURL, { mode: "cors" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const blob = await response.blob();
+      const fileName = remoteURL.split("/").pop() || "remote-video.mp4";
+      const file = new File([blob], fileName, { type: blob.type || "video/mp4" });
+
+      // Save to IndexedDB
+      const storageKey = `video_${sceneId}`;
+      const saved = await this.saveVideoToIDB(storageKey, file);
+      if (!saved) {
+        throw new Error("Failed to save video to IndexedDB.");
+      }
+
+      // Create blob URL and update scene
+      const blobURL = URL.createObjectURL(blob);
+      scene.videoSrc = blobURL;
+      scene.videoStorageKey = storageKey;
+      
+      this.saveScenesData();
+      this.hideLoadingIndicator();
+
+      console.log(`✅ Video downloaded successfully for scene ${sceneId}`);
+
+    } catch (error) {
+      console.warn("Client-side fetch failed, trying server-side:", error);
+      
+      // Silently try server-side fetch
+      try {
+        const response = await fetch("/fetch-video", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: remoteURL })
+        });
+
+        if (!response.ok) {
+          throw new Error(`Server returned ${response.status}`);
+        }
+
+        const blob = await response.blob();
+        const fileName = remoteURL.split("/").pop() || "remote-video.mp4";
+        const file = new File([blob], fileName, { type: blob.type || "video/mp4" });
+
+        // Save to IndexedDB
+        const storageKey = `video_${sceneId}`;
+        const saved = await this.saveVideoToIDB(storageKey, file);
+        if (!saved) {
+          throw new Error("Failed to save video to IndexedDB.");
+        }
+
+        // Create blob URL and update scene
+        const blobURL = URL.createObjectURL(blob);
+        scene.videoSrc = blobURL;
+        scene.videoStorageKey = storageKey;
+        
+        this.saveScenesData();
+        this.hideLoadingIndicator();
+
+        console.log(`✅ Video downloaded via server for scene ${sceneId}`);
+
+      } catch (serverError) {
+        // If both fail, keep remote URL but hide loader
+        this.hideLoadingIndicator();
+        console.error("Both client and server download failed:", serverError);
+        
+        // Show user-friendly message
+        alert(
+          `⚠️ Unable to download video automatically.\n\n` +
+          `The video will stream from the remote URL, but:\n` +
+          `• Thumbnails may not be available\n` +
+          `• Export will reference the remote URL (requires internet)\n\n` +
+          `You can manually download and re-upload the video file for full offline support.`
+        );
+      }
+    }
+  }
+
+  async downloadRemoteVideoViaServer(sceneId, remoteURL) {
+    const scene = this.scenes[sceneId];
+    if (!scene) return;
+
+    this.showLoadingIndicator("Downloading video via server...");
+
+    try {
+      // Use server endpoint to fetch video
+      const response = await fetch("/fetch-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: remoteURL })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: "Unknown error" }));
+        throw new Error(errorData.error || `Server returned ${response.status}`);
+      }
+
+      const blob = await response.blob();
+      const fileName = remoteURL.split("/").pop() || "remote-video.mp4";
+      const file = new File([blob], fileName, { type: blob.type || "video/mp4" });
+
+      // Save to IndexedDB
+      const storageKey = `video_${sceneId}`;
+      const saved = await this.saveVideoToIDB(storageKey, file);
+      if (!saved) {
+        throw new Error("Failed to save video to IndexedDB.");
+      }
+
+      // Create blob URL and update scene
+      const blobURL = URL.createObjectURL(blob);
+      scene.videoSrc = blobURL;
+      scene.videoStorageKey = storageKey;
+      
+      // Clear old preview if any
+      if (this._videoPreviewCache && this._videoPreviewCache.has(sceneId)) {
+        this._videoPreviewCache.delete(sceneId);
+      }
+
+      this.saveScenesData();
+      this.hideLoadingIndicator();
+
+      alert(`✅ Video downloaded successfully via server!\n\nYou can now:\n• Generate thumbnails for navigation previews\n• Export this scene offline\n• The video is stored locally`);
+
+      // Reload scene manager
+      this.showSceneManager();
+
+      // Reload current scene if this is the active scene
+      if (this.currentScene === sceneId) {
+        this.loadCurrentScene();
+      }
+
+    } catch (error) {
+      this.hideLoadingIndicator();
+      console.error("Server-side download failed:", error);
+      alert(`❌ Server download failed:\n\n${error.message}\n\nPlease check:\n• The URL is correct and accessible\n• The server is running\n• The video file isn't too large (max 500MB)`);
+    }
+  }
+
+  async rehydrateVideoSourcesFromIDB() {
+    try {
+      const entries = Object.entries(this.scenes || {});
+      if (!entries.length) return;
+      let changed = false;
+      for (const [sceneId, scene] of entries) {
+        if (!scene || scene.type !== 'video') continue;
+        const key = scene.videoStorageKey || sceneId;
+        // Skip if remote URL
+        if (scene.videoSrc && (scene.videoSrc.startsWith('http://') || scene.videoSrc.startsWith('https://'))) continue;
+        const rec = await this.getVideoFromIDB(key);
+        if (rec && rec.blob) {
+          try {
+            const url = URL.createObjectURL(rec.blob);
+            scene.videoSrc = url;
+            if (!scene.videoFileName) scene.videoFileName = rec.name || '';
+            changed = true;
+          } catch (_) { /* ignore */ }
+        } else {
+          // If no record found and no remote URL, keep src null; we’ll prompt on first load
+        }
+      }
+      if (changed) this.saveScenesData();
+    } catch (_) { /* ignore */ }
+  }
+
+  async requestPersistentStorage() {
+    try {
+      if (navigator.storage && navigator.storage.persist) {
+        await navigator.storage.persist();
+      }
+    } catch (_) { /* ignore */ }
   }
 
   // ===== Crossfade helpers (Editor) =====
@@ -344,6 +848,79 @@ class HotspotEditor {
     }
   }
 
+  updateVideoControls(videoEl, scene) {
+    const controls = document.getElementById("video-controls");
+    if (!controls) return;
+
+    controls.style.display = "flex";
+
+    // Play/Pause button
+    const playPauseBtn = document.getElementById("video-play-pause");
+    playPauseBtn.onclick = () => {
+      if (videoEl.paused) {
+        videoEl.play();
+        playPauseBtn.textContent = "⏸ Pause";
+      } else {
+        videoEl.pause();
+        playPauseBtn.textContent = "▶ Play";
+      }
+    };
+
+    // Mute/Unmute button
+    const muteBtn = document.getElementById("video-mute");
+    muteBtn.onclick = () => {
+      videoEl.muted = !videoEl.muted;
+      muteBtn.textContent = videoEl.muted ? "🔇 Muted" : "🔊 Sound";
+      muteBtn.style.background = videoEl.muted ? "#28a745" : "#ffc107";
+    };
+
+    // Progress bar
+    const progressBar = document.getElementById("video-progress");
+    const currentTimeEl = document.getElementById("video-time-current");
+    const totalTimeEl = document.getElementById("video-time-total");
+
+    videoEl.addEventListener("loadedmetadata", () => {
+      totalTimeEl.textContent = this.formatTime(videoEl.duration);
+    });
+
+    videoEl.addEventListener("timeupdate", () => {
+      const progress = (videoEl.currentTime / videoEl.duration) * 100;
+      progressBar.value = progress;
+      currentTimeEl.textContent = this.formatTime(videoEl.currentTime);
+    });
+
+    progressBar.addEventListener("input", (e) => {
+      const time = (e.target.value / 100) * videoEl.duration;
+      videoEl.currentTime = time;
+    });
+
+    // Volume control
+    const volumeSlider = document.getElementById("video-volume");
+    volumeSlider.value = (scene.videoVolume || 0.5) * 100;
+    videoEl.volume = scene.videoVolume || 0.5;
+
+    volumeSlider.addEventListener("input", (e) => {
+      const volume = e.target.value / 100;
+      videoEl.volume = volume;
+      scene.videoVolume = volume;
+      this.saveScenesData();
+    });
+  }
+
+  hideVideoControls() {
+    const controls = document.getElementById("video-controls");
+    if (controls) {
+      controls.style.display = "none";
+    }
+  }
+
+  formatTime(seconds) {
+    if (isNaN(seconds)) return "0:00";
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, "0")}`;
+  }
+
   _dispatchSceneLoaded() {
     try {
       const ev = new CustomEvent("vrhotspots:scene-loaded");
@@ -398,14 +975,46 @@ class HotspotEditor {
   _getEditorPreviewSrc(sceneId) {
     const sc = this.scenes[sceneId];
     if (!sc) return null;
+    // If target scene is a video, return special flag so caller can show icon
+    if (sc.type === 'video') return 'VIDEO_ICON';
     const img = sc.image || "";
     if (
       img.startsWith("http://") ||
       img.startsWith("https://") ||
-      img.startsWith("data:")
+      img.startsWith("data:") ||
+      img.startsWith("blob:") ||
+      img.startsWith("#")
     )
       return img;
     return img.startsWith("./") ? img : `./${img}`;
+  }
+
+  // Ensure there's an <img> in <a-assets> for a given preview src and return its selector id
+  _ensurePreviewAsset(src, key) {
+    try {
+      let assets = document.querySelector('a-assets');
+      if (!assets) {
+        assets = document.createElement('a-assets');
+        const scene = document.querySelector('a-scene') || document.body;
+        scene.insertBefore(assets, scene.firstChild);
+      }
+      const safeKey = String(key).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const id = `nav-preview-${safeKey}`;
+      let img = document.getElementById(id);
+      if (!img) {
+        img = document.createElement('img');
+        img.id = id;
+        img.crossOrigin = 'anonymous';
+        assets.appendChild(img);
+      }
+      if (img.getAttribute('src') !== src) {
+        img.setAttribute('src', src);
+      }
+      return `#${id}`;
+    } catch (e) {
+      console.warn('[Preview][Assets] Failed to ensure asset', e);
+      return src; // fallback to raw src
+    }
   }
 
   _showNavPreview(sceneId) {
@@ -415,7 +1024,18 @@ class HotspotEditor {
     const sc = this.scenes[sceneId];
     if (!sc) return;
     const src = this._getEditorPreviewSrc(sceneId);
-    if (src) imgEl.src = src;
+      if (src === 'VIDEO_ICON') {
+        // Attempt to create a thumbnail for the video
+        (async () => {
+          const thumb = await this._ensureVideoPreview(sceneId);
+          if (thumb) imgEl.src = thumb; else {
+            const svg = encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="128" height="128"><rect rx="4" ry="4" x="2" y="6" width="14" height="12" fill="#111" stroke="#2ae" stroke-width="2"/><polygon points="16,10 22,7 22,17 16,14" fill="#2ae"/></svg>');
+            imgEl.src = 'data:image/svg+xml;charset=UTF-8,' + svg;
+          }
+        })();
+      } else if (src) {
+        imgEl.src = src;
+    }
     cap.textContent = `Go to: ${sc.name || sceneId}`;
     box.style.display = "block";
     // Begin tracking mouse
@@ -498,6 +1118,13 @@ class HotspotEditor {
       .addEventListener("change", (e) => {
         this.navigationMode = !e.target.checked;
         this.updateModeIndicator();
+        this._updateAddHotspotButtonState();
+        // Auto-collapse hotspot type when leaving edit mode; expand when entering
+        this._setHotspotTypeCollapsed(!e.target.checked);
+        // Hide hotspot properties when not in edit mode
+        this._setHotspotPropertiesVisible(!!e.target.checked);
+        // Sync visible toggle button text/help
+        this._syncEditModeToggleUI();
       });
 
     // Scene management
@@ -513,7 +1140,41 @@ class HotspotEditor {
       this.switchToScene(e.target.value);
     });
 
-    // Starting point controls
+  // Ensure initial button state matches toggle on load
+  this._updateAddHotspotButtonState();
+
+    // Visible switch -> flip hidden checkbox and dispatch change
+    try {
+      const sw = document.getElementById('edit-mode-switch');
+      if (sw) {
+        const activate = () => {
+          const toggle = document.getElementById('edit-mode-toggle');
+          if (!toggle) return;
+          toggle.checked = !toggle.checked;
+          toggle.dispatchEvent(new Event('change', { bubbles: true }));
+          this._syncEditModeToggleUI();
+        };
+        sw.addEventListener('click', activate);
+        sw.addEventListener('keydown', (e) => {
+          if (e.key === ' ' || e.key === 'Enter') {
+            e.preventDefault();
+            activate();
+          }
+        });
+      }
+    } catch (_) { /* ignore */ }
+
+    // Setup collapsible Hotspot Type section
+  this._initHotspotTypeCollapsible();
+
+    // Initialize Hotspot Properties visibility based on toggle
+    try {
+      const toggle = document.getElementById('edit-mode-toggle');
+      this._setHotspotPropertiesVisible(toggle ? !!toggle.checked : true);
+      this._syncEditModeToggleUI();
+    } catch (_) { /* ignore */ }
+
+  // Starting point controls
     document
       .getElementById("set-starting-point")
       .addEventListener("click", () => {
@@ -542,11 +1203,12 @@ class HotspotEditor {
         }
       });
 
-    // Global sound controls
+    // Global sound controls (hidden native checkbox)
     document
       .getElementById("global-sound-enabled")
       .addEventListener("change", (e) => {
         this.toggleGlobalSoundControls(e.target.checked);
+        this._syncGlobalSoundToggleUI();
       });
 
     // Global sound file/URL coordination
@@ -581,7 +1243,142 @@ class HotspotEditor {
         this.toggleEditorGlobalSound();
       });
 
+    // Visible Global Sound switch -> flip hidden checkbox and dispatch change
+    try {
+      const gs = document.getElementById('global-sound-switch');
+      if (gs) {
+        const activateGS = () => {
+          const chk = document.getElementById('global-sound-enabled');
+          if (!chk) return;
+          chk.checked = !chk.checked;
+          chk.dispatchEvent(new Event('change', { bubbles: true }));
+          this._syncGlobalSoundToggleUI();
+        };
+        gs.addEventListener('click', activateGS);
+        gs.addEventListener('keydown', (e) => {
+          if (e.key === ' ' || e.key === 'Enter') {
+            e.preventDefault();
+            activateGS();
+          }
+        });
+      }
+    } catch (_) { /* ignore */ }
+
+    // Initial sync for global sound switch
+    this._syncGlobalSoundToggleUI();
+
     this.setupEditorProgressBar();
+  }
+
+  _updateAddHotspotButtonState() {
+    try {
+      const btn = document.getElementById("add-hotspot");
+      const toggle = document.getElementById("edit-mode-toggle");
+      if (!btn || !toggle) return;
+      const enabled = !!toggle.checked;
+      btn.disabled = !enabled;
+      btn.setAttribute("aria-disabled", String(!enabled));
+      // Visual affordances for disabled state
+      btn.style.opacity = enabled ? "" : "0.5";
+      // Show a cross/forbidden cursor on hover when disabled
+      btn.style.cursor = enabled ? "" : "not-allowed";
+      if (!enabled) {
+        btn.title = "Enable Edit Mode to add hotspots.";
+      } else {
+        btn.removeAttribute("title");
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  _initHotspotTypeCollapsible() {
+    try {
+      const section = document.getElementById('hotspot-type-section');
+      const title = document.getElementById('hotspot-type-title');
+      const caret = document.getElementById('hotspot-type-caret');
+      if (!section || !title || !caret) return;
+
+      // Click to toggle
+      title.addEventListener('click', () => {
+        const currentlyCollapsed = section.dataset.collapsed === 'true';
+        this._setHotspotTypeCollapsed(!currentlyCollapsed);
+      });
+
+      // Initial collapsed state based on Edit Mode toggle
+      const toggle = document.getElementById('edit-mode-toggle');
+      const collapsed = toggle ? !toggle.checked : false;
+      this._setHotspotTypeCollapsed(collapsed);
+    } catch (_) { /* ignore */ }
+  }
+
+  _setHotspotTypeCollapsed(collapsed) {
+    try {
+      const section = document.getElementById('hotspot-type-section');
+      const caret = document.getElementById('hotspot-type-caret');
+      if (!section || !caret) return;
+      section.dataset.collapsed = String(!!collapsed);
+      // Hide/show all hotspot type rows inside the section (leave title visible)
+      const rows = section.querySelectorAll('.hotspot-type');
+      rows.forEach((row) => {
+        row.style.display = collapsed ? 'none' : '';
+      });
+      // Also hide/show the merged properties group when collapsing
+      const propsGroup = document.getElementById('hotspot-properties-group');
+      if (propsGroup) propsGroup.style.display = collapsed ? 'none' : '';
+      caret.textContent = collapsed ? '▲' : '▼';
+      caret.style.transform = collapsed ? 'rotate(180deg)' : '';
+      caret.style.transition = 'transform 120ms ease-out';
+    } catch (_) { /* ignore */ }
+  }
+
+  _setHotspotPropertiesVisible(visible) {
+    try {
+      // Prefer merged group inside Hotspot Type section; fallback to legacy separate section
+      const props = document.getElementById('hotspot-properties-group') || document.getElementById('hotspot-properties-section');
+      if (!props) return;
+      props.style.display = visible ? '' : 'none';
+    } catch (_) { /* ignore */ }
+  }
+
+  _syncEditModeToggleUI() {
+    try {
+      const toggle = document.getElementById('edit-mode-toggle');
+      const sw = document.getElementById('edit-mode-switch');
+      const thumb = sw ? sw.querySelector('.thumb') : null;
+      const label = document.getElementById('edit-mode-label');
+      const help = document.getElementById('edit-mode-help');
+      if (!toggle || !sw || !thumb || !label) return;
+      const isEdit = !!toggle.checked;
+
+      // Update visuals
+      sw.setAttribute('aria-checked', String(isEdit));
+      sw.style.background = isEdit ? '#4caf50' : '#777';
+      thumb.style.left = isEdit ? '26px' : '2px';
+
+      // Update text
+      label.textContent = isEdit ? '🛠️ Edit Mode: ON' : '🧭 Navigation Mode: ON';
+      if (help) help.textContent = isEdit ? 'Click to switch to Navigation Mode' : 'Click to switch to Edit Mode';
+    } catch (_) { /* ignore */ }
+  }
+
+  _syncGlobalSoundToggleUI() {
+    try {
+      const chk = document.getElementById('global-sound-enabled');
+      const sw = document.getElementById('global-sound-switch');
+      const thumb = sw ? sw.querySelector('.thumb') : null;
+      const label = document.getElementById('global-sound-label');
+      const help = document.getElementById('global-sound-help');
+      if (!chk || !sw || !thumb || !label) return;
+      const isOn = !!chk.checked;
+
+      // Update visuals
+      sw.setAttribute('aria-checked', String(isOn));
+      sw.style.background = isOn ? '#4caf50' : '#777';
+      thumb.style.left = isOn ? '26px' : '2px';
+
+      // Update texts
+      label.textContent = isOn ? '🎵 Scene Audio: ON' : '🔇 Scene Audio: OFF';
+      if (help) help.textContent = isOn ? 'Click to disable ambient sound for this scene' : 'Click to enable ambient sound for this scene';
+    } catch (_) { /* ignore */ }
   }
 
   setupHotspotTypeSelection() {
@@ -704,6 +1501,13 @@ class HotspotEditor {
   }
 
   enterEditMode() {
+    // Gate entering edit mode by the UI toggle to prevent accidental placement
+    const toggle = document.getElementById("edit-mode-toggle");
+    // If the toggle exists and is unchecked, do not allow entering edit mode (button appears disabled)
+    if (toggle && !toggle.checked) {
+      return;
+    }
+
     this.editMode = true;
     document.getElementById("edit-indicator").style.display = "block";
     this.updateModeIndicator(); // Keep instructions consistent
@@ -796,30 +1600,64 @@ class HotspotEditor {
     this.updateHotspotList();
     this.saveScenesData(); // Save after adding hotspot
 
-    // If the image is a File, convert to data URL so it survives localStorage reloads
+    // If the audio is a File, persist it into IndexedDB similar to images
+    if ((hotspotData.type === "audio" || hotspotData.type === "text-audio") && hotspotData.audio instanceof File) {
+      (async () => {
+        try {
+          const fileRef = hotspotData.audio;
+          const storageKey = hotspotData.audioStorageKey || `audio_hotspot_${hotspotData.id}`;
+          const saved = await this.saveAudioToIDB(storageKey, fileRef);
+          if (saved) {
+            hotspotData.audioStorageKey = storageKey;
+            hotspotData.audioFileName = fileRef.name || null;
+            // Create blob URL for immediate playback
+            const blobURL = URL.createObjectURL(fileRef);
+            hotspotData.audio = blobURL;
+            const scH = this.scenes[this.currentScene].hotspots.find((h) => h.id === hotspotData.id);
+            if (scH) {
+              scH.audioStorageKey = storageKey;
+              scH.audioFileName = fileRef.name || null;
+              scH.audio = blobURL;
+            }
+            this.saveScenesData();
+          }
+        } catch (err) {
+          console.warn("[AudioHotspot] Failed to save audio to IndexedDB", err);
+        }
+      })();
+    }
+
+    // If the image is a File, persist it into IndexedDB to avoid localStorage bloat
     if (hotspotData.type === "image" && hotspotData.image instanceof File) {
-      const fileRef = hotspotData.image;
-      this._fileToDataURL(fileRef)
-        .then((dataUrl) => {
-          // Replace stored image with data URL
-          hotspotData.image = dataUrl;
-          hotspotData.imageFileName = fileRef.name || null;
-          // Update scene hotspot reference too
-          const sceneHs = this.scenes[this.currentScene].hotspots.find(
-            (h) => h.id === hotspotData.id
-          );
-          if (sceneHs) sceneHs.image = dataUrl;
-          if (sceneHs) sceneHs.imageFileName = fileRef.name || null;
-          // Update existing entity's image src
-          const el = document.getElementById(`hotspot-${hotspotData.id}`);
-          const imgEnt = el?.querySelector(".static-image-hotspot");
-          if (imgEnt) imgEnt.setAttribute("src", dataUrl);
-          // Persist again with data URL
-          this.saveScenesData();
-        })
-        .catch((err) =>
-          console.warn("[ImageHotspot] Failed to convert file to data URL", err)
-        );
+      (async () => {
+        try {
+          const fileRef = hotspotData.image;
+          const storageKey = hotspotData.imageStorageKey || `image_hotspot_${hotspotData.id}`;
+          const saved = await this.saveImageToIDB(storageKey, fileRef);
+          if (saved) {
+            hotspotData.imageStorageKey = storageKey;
+            hotspotData.imageFileName = fileRef.name || null;
+            // Create blob URL for immediate display
+            const blobURL = URL.createObjectURL(fileRef);
+            hotspotData.image = blobURL;
+            // Update scene hotspot reference too
+            const sceneHs = this.scenes[this.currentScene].hotspots.find((h) => h.id === hotspotData.id);
+            if (sceneHs) {
+              sceneHs.imageStorageKey = storageKey;
+              sceneHs.imageFileName = fileRef.name || null;
+              sceneHs.image = blobURL;
+            }
+            // Update existing entity's image src
+            const el = document.getElementById(`hotspot-${hotspotData.id}`);
+            const imgEnt = el?.querySelector(".static-image-hotspot");
+            if (imgEnt) imgEnt.setAttribute("src", blobURL);
+            // Persist again with stripped blobs (saveScenesData will strip blob URLs when storageKey exists)
+            this.saveScenesData();
+          }
+        } catch (err) {
+          console.warn("[ImageHotspot] Failed to save image to IndexedDB", err);
+        }
+      })();
     }
     // If weblink preview is a File, convert to data URL to persist
     if (
@@ -947,6 +1785,10 @@ class HotspotEditor {
 
   createHotspotElement(data) {
     const container = document.getElementById("hotspot-container");
+    // Track whether this image hotspot should lazy-load its blob from IndexedDB after element creation
+    let _imageHasStorageKey = false;
+    // Candidate key to use when loading image blobs from IndexedDB (supports legacy key naming)
+    let _imageLoadKey = null;
     let hotspotEl;
     if (data.type === "navigation" || data.type === "weblink") {
       // Parent container
@@ -986,15 +1828,16 @@ class HotspotEditor {
       // Visible green border ring (approx. 3px) with transparent center
       const ring = document.createElement("a-entity");
       ring.setAttribute(
-        "geometry",
-        `primitive: ring; radiusInner: ${ringInner}; radiusOuter: ${ringOuter}`
-      );
-      ring.setAttribute(
-        "material",
-        `color: ${ringColor}; opacity: 1; transparent: true; shader: flat`
-      );
-      // Bring the ring much closer to the camera so it renders in front of audio/text hotspots
-      ring.setAttribute("position", "0 0 0.15");
+            "geometry",
+            `primitive: ring; radiusInner: ${ringInner}; radiusOuter: ${ringOuter}`
+          );
+          // Double-sided to ensure visibility regardless of facing, flat shader for crisp edges
+          ring.setAttribute(
+            "material",
+            `color: ${ringColor}; opacity: 1; transparent: true; shader: flat; side: double`
+          );
+          // Nudge closer to the camera so it renders in front of nearby UI
+          ring.setAttribute("position", "0 0 0.2");
       ring.classList.add("nav-ring");
       hotspotEl.appendChild(ring);
 
@@ -1006,7 +1849,7 @@ class HotspotEditor {
       );
       preview.setAttribute(
         "material",
-        "transparent: true; opacity: 1; shader: flat; side: double; alphaTest: 0.01"
+        "transparent: true; opacity: 1; shader: flat; side: double; alphaTest: 0.01; npot: true"
       );
       preview.setAttribute("visible", "false");
       // Keep preview just behind the ring but still well in front of other UI
@@ -1069,12 +1912,11 @@ class HotspotEditor {
       const lblColor = (navStyles && navStyles.labelColor) || "#fff";
       labelText.setAttribute("color", lblColor);
       labelText.setAttribute("width", "5");
-      // labelText.setAttribute('scale', '1.2 1.2 1');
       labelText.setAttribute("position", "0 0 0.01");
       labelGroup.appendChild(labelBg);
       labelGroup.appendChild(labelText);
       hotspotEl.appendChild(labelGroup);
-    } else {
+      } else {
       // For non-navigation hotspots use a transparent plane for click targeting, except image hotspots
       hotspotEl = document.createElement("a-entity");
       if (data.type !== "image") {
@@ -1082,16 +1924,17 @@ class HotspotEditor {
           "geometry",
           "primitive: plane; width: 0.7; height: 0.7"
         );
-        // depthWrite:false prevents the fully transparent plane from occluding underlying imagery
+        // Prevent the fully transparent plane from occluding portals by disabling depth writes/tests
         hotspotEl.setAttribute(
           "material",
-          "opacity: 0; transparent: true; depthWrite: false; side: double"
+          "opacity: 0; transparent: true; depthWrite: false; depthTest: false; side: double"
         );
+        hotspotEl.classList.add("clickable");
       }
       // Always face camera for consistent UI orientation
       hotspotEl.setAttribute("face-camera", "");
     }
-    hotspotEl.setAttribute("id", `hotspot-${data.id}`);
+  hotspotEl.setAttribute("id", `hotspot-${data.id}`);
     hotspotEl.setAttribute("position", data.position);
     // Only navigation parent is clickable; others use child elements for clicks
     if (data.type === "navigation" || data.type === "weblink") {
@@ -1118,6 +1961,31 @@ class HotspotEditor {
         data.audio instanceof File
       ) {
         audioSrc = URL.createObjectURL(data.audio);
+      }
+
+      // If the audio source is a transient blob/data URL, place it into <a-assets>
+      // and reference it by ID to avoid occasional blob fetch failures in A-Frame.
+      if (typeof audioSrc === "string" && (audioSrc.startsWith("blob:") || audioSrc.startsWith("data:"))) {
+        try {
+          const assets = document.querySelector('a-assets') || (function(){
+            const scn = document.querySelector('a-scene') || document.querySelector('scene, a-scene');
+            const a = document.createElement('a-assets');
+            if (scn) scn.insertBefore(a, scn.firstChild);
+            return a;
+          })();
+          const assetId = `audio_hs_${data.id}`;
+          let assetEl = assets.querySelector(`#${assetId}`);
+          if (!assetEl) {
+            assetEl = document.createElement('audio');
+            assetEl.setAttribute('id', assetId);
+            assetEl.setAttribute('crossorigin', 'anonymous');
+            assets.appendChild(assetEl);
+          }
+          // Always set/update src in case the blob changed
+          assetEl.setAttribute('src', audioSrc);
+          // Reference via asset ID for stable loading
+          audioSrc = `#${assetId}`;
+        } catch (_) { /* non-fatal; fall back to direct blob URL */ }
       }
 
       spotConfig += `;audio:${audioSrc}`;
@@ -1153,6 +2021,10 @@ class HotspotEditor {
 
     if (data.type === "image") {
       let imgSrc = "";
+      // If we have an image stored in IDB (from a previous session), resolve it lazily
+      // Prefer explicit key, but fall back to legacy pattern image_hotspot_<id>
+      _imageLoadKey = data.imageStorageKey || (typeof data.id === 'number' ? `image_hotspot_${data.id}` : null);
+      _imageHasStorageKey = !!_imageLoadKey && (!data.image || typeof data.image !== 'string' || data.image.startsWith('blob:'));
       if (data.image instanceof File) {
         try {
           imgSrc = URL.createObjectURL(data.image);
@@ -1221,6 +2093,12 @@ class HotspotEditor {
           }
         }
       } else if (typeof data.image === "string") imgSrc = data.image;
+          // If we have a stored image key but the src is a stale blob URL from a previous session,
+          // start with a tiny transparent pixel so the element initializes cleanly, and we'll
+          // swap in the fresh blob from IndexedDB right after append.
+          if (_imageHasStorageKey && (!imgSrc || (typeof imgSrc === 'string' && imgSrc.startsWith('blob:')))) {
+            imgSrc = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=';
+          }
       const scale = typeof data.imageScale === "number" ? data.imageScale : 1;
       const encodedImgSrc =
         imgSrc && imgSrc.includes(";") ? encodeURIComponent(imgSrc) : imgSrc;
@@ -1288,7 +2166,7 @@ class HotspotEditor {
         scheduleFallback(800);
         scheduleFallback(2000);
       }
-    }
+  }
 
     hotspotEl.setAttribute("editor-spot", spotConfig);
 
@@ -1320,8 +2198,9 @@ class HotspotEditor {
       targetEl.addEventListener("mouseenter", () => {
         if (previewEl) {
           let src = null;
-          if (data.type === "navigation")
+          if (data.type === "navigation") {
             src = this._getEditorPreviewSrc(data.navigationTarget);
+          }
           else if (data.type === "weblink") {
             if (data.weblinkPreview instanceof File) {
               try {
@@ -1334,7 +2213,34 @@ class HotspotEditor {
               src = data.weblinkPreview;
             }
           }
-          if (src) {
+          if (src === 'VIDEO_ICON') {
+            // Try to generate a thumbnail from the destination video
+            (async () => {
+              const thumb = await this._ensureVideoPreview(data.navigationTarget);
+              const matSrc = thumb || 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="128" height="128"><rect rx="4" ry="4" x="2" y="6" width="14" height="12" fill="#111" stroke="#2ae" stroke-width="2"/><polygon points="16,10 22,7 22,17 16,14" fill="#2ae"/></svg>');
+              previewEl.setAttribute("material", "src", matSrc);
+              previewEl.setAttribute("material", "transparent", true);
+              previewEl.setAttribute("material", "opacity", 1);
+              previewEl.setAttribute("material", "shader", "flat");
+              previewEl.setAttribute("material", "side", "double");
+              previewEl.setAttribute("material", "alphaTest", 0.01);
+              previewEl.setAttribute("material", "npot", true);
+              // Debug: verify texture binding shortly after
+              setTimeout(() => {
+                try {
+                  const mesh = previewEl.getObject3D('mesh');
+                  const ok = !!(mesh && mesh.material && mesh.material.map && mesh.material.map.image && mesh.material.map.image.naturalWidth);
+                  console.log('[Preview][Check][VideoThumb]', { ok, matSrc, hasMesh: !!mesh });
+                } catch (_) {}
+              }, 120);
+            })();
+            previewEl.setAttribute("material", "transparent", true);
+            previewEl.setAttribute("material", "opacity", 1);
+            previewEl.setAttribute("material", "shader", "flat");
+            previewEl.setAttribute("material", "side", "double");
+            previewEl.setAttribute("material", "alphaTest", 0.01);
+            previewEl.setAttribute("material", "npot", true);
+          } else if (src) {
             console.log("[Preview][Hover][Editor]", {
               id: data.id,
               type: data.type,
@@ -1347,6 +2253,43 @@ class HotspotEditor {
             previewEl.setAttribute("material", "shader", "flat");
             previewEl.setAttribute("material", "side", "double");
             previewEl.setAttribute("material", "alphaTest", 0.01);
+            previewEl.setAttribute("material", "npot", true);
+            // Debug: verify texture binding shortly after
+            setTimeout(() => {
+              try {
+                const mesh = previewEl.getObject3D('mesh');
+                const m = mesh && mesh.material;
+                const img = m && m.map && m.map.image;
+                console.log('[Preview][Check]', {
+                  hasMesh: !!mesh,
+                  hasMap: !!(m && m.map),
+                  imgW: img && img.naturalWidth,
+                  imgH: img && img.naturalHeight,
+                  color: m && m.color && m.color.getHexString && m.color.getHexString(),
+                  npot: m && m.npot,
+                });
+                // If still no map image dimensions, try to nudge material by reassigning src once
+                if (!(img && img.naturalWidth)) {
+                  // Create or reuse an <img> asset and point the material to it
+                  const assetSel = this._ensurePreviewAsset(src, data.navigationTarget || data.id);
+                  previewEl.setAttribute('material', 'src', assetSel);
+                  // Re-check once more
+                  setTimeout(() => {
+                    try {
+                      const mesh2 = previewEl.getObject3D('mesh');
+                      const m2 = mesh2 && mesh2.material;
+                      const img2 = m2 && m2.map && m2.map.image;
+                      console.log('[Preview][Check][Asset]', {
+                        ok: !!(img2 && img2.naturalWidth),
+                        assetSel,
+                        imgW: img2 && img2.naturalWidth,
+                        imgH: img2 && img2.naturalHeight,
+                      });
+                    } catch (_) {}
+                  }, 120);
+                }
+              } catch (_) {}
+            }, 150);
           } else if (data.type === "weblink") {
             // Fallback: subtle fill to indicate active portal when no preview image is provided
             previewEl.setAttribute("material", "color", "#000");
@@ -1436,6 +2379,79 @@ class HotspotEditor {
 
     container.appendChild(hotspotEl);
     if (data.type === "image") {
+      // If we need to resolve an image from IDB, do it after entity creation
+      if (_imageHasStorageKey) {
+        (async () => {
+          try {
+            const rec = await this.getImageFromIDB(_imageLoadKey);
+            if (rec && rec.blob) {
+              const url = URL.createObjectURL(rec.blob);
+              const imgEnt = hotspotEl.querySelector('.static-image-hotspot');
+              if (imgEnt) {
+                imgEnt.setAttribute('src', url);
+                // mark into data so subsequent saves can strip the blob (storageKey persisted separately)
+                data.image = url;
+                // If rounded corners are enabled, re-apply mask now that real image is in place
+                try {
+                  const istyleNow = this.customStyles && this.customStyles.image;
+                  if (istyleNow && istyleNow.borderRadius && istyleNow.borderRadius > 0) {
+                    applyRoundedMaskToAImage(imgEnt, istyleNow, true);
+                  }
+                } catch(_) {}
+                // Re-evaluate aspect ratio based on the real texture once it binds
+                const applyRealAR = () => {
+                  try {
+                    const mesh = imgEnt.getObject3D('mesh');
+                    const texImg = mesh && mesh.material && mesh.material.map && mesh.material.map.image;
+                    const nW = texImg && (texImg.naturalWidth || texImg.width) || 0;
+                    const nH = texImg && (texImg.naturalHeight || texImg.height) || 0;
+                    const ratio = nW > 0 && nH > 0 ? nH / nW : 0;
+                    if (ratio && isFinite(ratio) && ratio > 0) {
+                      imgEnt.dataset.aspectRatio = String(ratio);
+                      const scl = (typeof data.imageScale === 'number' ? data.imageScale : 1);
+                      imgEnt.setAttribute('width', 1);
+                      imgEnt.setAttribute('height', ratio);
+                      imgEnt.setAttribute('position', `0 ${(ratio / 2) * scl} 0.05`);
+                      // Adjust border frame if present
+                      const frame = hotspotEl.querySelector('.static-image-border');
+                      if (frame) {
+                        const bw = (this.customStyles && this.customStyles.image && this.customStyles.image.borderWidth) || 0;
+                        frame.setAttribute('width', 1 * scl + bw * 2);
+                        frame.setAttribute('height', ratio * scl + bw * 2);
+                        frame.setAttribute('position', `0 ${(ratio / 2) * scl} 0.0`);
+                      }
+                      // Persist to model
+                      try {
+                        if (window.hotspotEditor) window.hotspotEditor._persistImageAspectRatio(data.id, ratio);
+                      } catch(_) {}
+                      return true;
+                    }
+                  } catch(_) {}
+                  return false;
+                };
+                // Listen for texture ready and also poll shortly after
+                const onTexReady = () => { applyRealAR(); };
+                imgEnt.addEventListener('materialtextureloaded', onTexReady, { once: true });
+                setTimeout(applyRealAR, 150);
+                setTimeout(applyRealAR, 500);
+                // If we loaded using a legacy-derived key, persist it onto the data model for future sessions
+                if (!_imageLoadKey || !data) { /* no-op */ }
+                else {
+                  if (!data.imageStorageKey) {
+                    data.imageStorageKey = _imageLoadKey;
+                    try {
+                      // Update the saved scene hotspot as well
+                      const scHs = (this.scenes[this.currentScene] && this.scenes[this.currentScene].hotspots || []).find(h => h && h.id === data.id);
+                      if (scHs && !scHs.imageStorageKey) scHs.imageStorageKey = _imageLoadKey;
+                      this.saveScenesData();
+                    } catch(_) {}
+                  }
+                }
+              }
+            }
+          } catch (_) { /* ignore */ }
+        })();
+      }
       // After entity is created, hook into the a-image to persist AR to model once known
       setTimeout(() => {
         try {
@@ -2339,35 +3355,59 @@ class HotspotEditor {
         }
       }
       if (isImageType) {
-        // If replacing with a File, defer final save until conversion completes
+        // If replacing with a File, store into IndexedDB and use a blob URL at runtime
         if (newImage instanceof File) {
-          const pendingFile = newImage;
-          // Temporary: keep object URL already applied by earlier logic; convert for persistence
-          this._fileToDataURL(pendingFile)
-            .then((dataUrl) => {
-              hotspot.image = dataUrl;
-              hotspot.imageScale = newImageScale;
-              hotspot.imageFileName = pendingFile.name || null;
-              delete hotspot.imageWidth;
-              delete hotspot.imageHeight;
-              const sceneHs = this.scenes[this.currentScene].hotspots.find(
-                (h) => h.id === hotspot.id
-              );
-              if (sceneHs) sceneHs.image = dataUrl;
-              if (sceneHs) sceneHs.imageFileName = pendingFile.name || null;
-              this._refreshHotspotEntity(hotspot);
-              this.saveScenesData();
-            })
-            .catch((err) =>
-              console.warn("[ImageHotspot] Edit convert failed", err)
-            );
+          (async () => {
+            try {
+              const pendingFile = newImage;
+              const storageKey = hotspot.imageStorageKey || `image_hotspot_${hotspot.id}`;
+              const saved = await this.saveImageToIDB(storageKey, pendingFile);
+              if (saved) {
+                const blobUrl = URL.createObjectURL(pendingFile);
+                hotspot.image = blobUrl;
+                hotspot.imageScale = newImageScale;
+                hotspot.imageFileName = pendingFile.name || null;
+                hotspot.imageStorageKey = storageKey;
+                delete hotspot.imageWidth;
+                delete hotspot.imageHeight;
+
+                const sceneHs = this.scenes[this.currentScene].hotspots.find(
+                  (h) => h.id === hotspot.id
+                );
+                if (sceneHs) {
+                  sceneHs.image = blobUrl;
+                  sceneHs.imageScale = newImageScale;
+                  sceneHs.imageFileName = pendingFile.name || null;
+                  sceneHs.imageStorageKey = storageKey;
+                  delete sceneHs.imageWidth;
+                  delete sceneHs.imageHeight;
+                }
+
+                // Update existing entity's texture if present
+                const el = document.getElementById(`hotspot-${hotspot.id}`);
+                const imgEnt = el?.querySelector(".static-image-hotspot");
+                if (imgEnt) imgEnt.setAttribute("src", blobUrl);
+
+                // Persist (saveScenesData will strip blob: when storageKey exists)
+                this._refreshHotspotEntity(hotspot);
+                this.saveScenesData();
+              } else {
+                console.warn("[ImageHotspot] Failed to save edited image to IndexedDB");
+              }
+            } catch (err) {
+              console.warn("[ImageHotspot] Edit save to IDB failed", err);
+            }
+          })();
         } else {
+          // URL or unchanged
           hotspot.image = newImage;
           hotspot.imageScale = newImageScale;
           if (typeof newImage === "string" && !newImage.startsWith("data:")) {
             try {
               const urlObj = new URL(newImage);
               hotspot.imageFileName = urlObj.pathname.split("/").pop() || null;
+              // If user switched to a URL, clear storageKey so we don't expect IDB
+              hotspot.imageStorageKey = null;
             } catch (_) {
               hotspot.imageFileName = hotspot.imageFileName || null;
             }
@@ -2918,100 +3958,8 @@ class HotspotEditor {
       document.getElementById("template-name").value ||
       `hotspot-project-${Date.now()}`;
 
-    // Show options dialog
-    const exportType = await this.showExportDialog();
-
-    if (exportType === "json") {
-      this.saveAsJSON(templateName);
-    } else if (exportType === "project") {
-      this.saveAsCompleteProject(templateName);
-    }
-  }
-
-  showExportDialog() {
-    return new Promise((resolve) => {
-      const dialog = document.createElement("div");
-      dialog.style.cssText = `
-        position: fixed; top: 0; left: 0; width: 100%; height: 100%; 
-        background: rgba(0,0,0,0.8); z-index: 10000; display: flex; 
-        align-items: center; justify-content: center; font-family: Arial;
-      `;
-
-      dialog.innerHTML = `
-        <div style="background: #2a2a2a; padding: 30px; border-radius: 10px; color: white; max-width: 500px;">
-          <h3 style="margin-top: 0; color: #4CAF50;">Export Options</h3>
-          <p>Choose how you want to save your hotspot project:</p>
-          
-          <div style="margin: 20px 0;">
-            <button id="export-json" style="
-              background: #4CAF50; color: white; border: none; padding: 15px 25px;
-              border-radius: 6px; cursor: pointer; margin: 5px; width: 200px;
-              font-size: 14px; font-weight: bold;
-            ">📄 JSON Template</button>
-            <div style="font-size: 12px; color: #ccc; margin-left: 5px;">
-              Save configuration only (requires existing project files)
-            </div>
-          </div>
-          
-          <div style="margin: 20px 0;">
-            <button id="export-project" style="
-              background: #2196F3; color: white; border: none; padding: 15px 25px;
-              border-radius: 6px; cursor: pointer; margin: 5px; width: 200px;
-              font-size: 14px; font-weight: bold;
-            ">📦 Complete Project</button>
-            <div style="font-size: 12px; color: #ccc; margin-left: 5px;">
-              Save everything as standalone project folder
-            </div>
-          </div>
-          
-          <button id="export-cancel" style="
-            background: #666; color: white; border: none; padding: 10px 20px;
-            border-radius: 4px; cursor: pointer; margin-top: 10px;
-          ">Cancel</button>
-        </div>
-      `;
-
-      document.body.appendChild(dialog);
-
-      document.getElementById("export-json").onclick = () => {
-        document.body.removeChild(dialog);
-        resolve("json");
-      };
-
-      document.getElementById("export-project").onclick = () => {
-        document.body.removeChild(dialog);
-        resolve("project");
-      };
-
-      document.getElementById("export-cancel").onclick = () => {
-        document.body.removeChild(dialog);
-        resolve(null);
-      };
-    });
-  }
-
-  saveAsJSON(templateName) {
-    const template = {
-      name: templateName,
-      created: new Date().toISOString(),
-      scenes: this.scenes, // Save all scenes instead of just hotspots
-      currentScene: this.getFirstSceneId(), // Use first scene as starting scene
-      hotspots: this.hotspots, // Keep for backwards compatibility
-      customStyles: this.customStyles, // Include custom CSS styles
-    };
-
-    // Create download link
-    const dataStr =
-      "data:text/json;charset=utf-8," +
-      encodeURIComponent(JSON.stringify(template, null, 2));
-    const downloadAnchorNode = document.createElement("a");
-    downloadAnchorNode.setAttribute("href", dataStr);
-    downloadAnchorNode.setAttribute("download", `${templateName}.json`);
-    document.body.appendChild(downloadAnchorNode);
-    downloadAnchorNode.click();
-    downloadAnchorNode.remove();
-
-    alert(`JSON template "${templateName}" saved!`);
+    // Save directly as ZIP (no dialog needed)
+    this.saveAsCompleteProject(templateName);
   }
 
   async saveAsCompleteProject(templateName) {
@@ -3068,8 +4016,9 @@ class HotspotEditor {
     zip.file("style.css", cssContent);
 
     // Create folders
-    const imagesFolder = zip.folder("images");
-    const audioFolder = zip.folder("audio");
+  const imagesFolder = zip.folder("images");
+  const audioFolder = zip.folder("audio");
+  const videosFolder = zip.folder("videos");
 
     // Add real assets from current project
     await this.addRealAssets(imagesFolder, audioFolder);
@@ -3080,7 +4029,8 @@ class HotspotEditor {
     // Add configuration with all scenes and hotspots (with corrected image/audio paths)
     const scenes = await this.normalizeScenePathsForExport(
       audioFolder,
-      imagesFolder
+      imagesFolder,
+      videosFolder
     );
     const config = {
       name: templateName,
@@ -3140,40 +4090,122 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
     }
   }
 
-  async normalizeScenePathsForExport(audioFolder, imagesFolder) {
+  async normalizeScenePathsForExport(audioFolder, imagesFolder, videosFolder) {
     const normalizedScenes = {};
+
+    // Helper to sanitize filenames for export (decode %20 etc. and remove illegal chars)
+    const sanitizeExportFileName = (name, fallbackExt = ".mp4") => {
+      if (!name || typeof name !== "string") return `file${fallbackExt}`;
+      let decoded = name;
+      try { decoded = decodeURIComponent(name); } catch (_) { /* keep as-is if bad URI */ }
+      // Trim and normalize whitespace
+      decoded = decoded.trim().replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ");
+      // Remove path fragments and illegal filename characters
+      decoded = decoded.replace(/^.*[\\\/]/, ""); // drop any directories
+      decoded = decoded.replace(/[\\/:*?"<>|]/g, "_"); // Windows-illegal
+      // Ensure we keep a reasonable extension
+      if (!/\.[a-zA-Z0-9]{2,5}$/.test(decoded) && fallbackExt) {
+        decoded += fallbackExt;
+      }
+      return decoded;
+    };
 
     for (const [sceneId, scene] of Object.entries(this.scenes)) {
       // Create new scene object without deep copying to preserve File objects
       const newScene = {
         name: scene.name,
+        type: scene.type || "image", // Include scene type
         image: this.getExportImagePath(scene.image, sceneId),
+        videoSrc: scene.videoSrc || null, // Include video source (may be replaced by exported path)
+        videoVolume: scene.videoVolume || 0.5, // Include video volume
         hotspots: [],
         startingPoint: scene.startingPoint,
         globalSound: null,
       };
 
-      // Handle global sound
-      if (scene.globalSound && scene.globalSound.enabled) {
-        const globalAudio = scene.globalSound.audio;
-        let normalizedAudio = null;
-
-        if (globalAudio instanceof File) {
-          // It's a File object, save to audio folder
-          const fileName = `global_${sceneId}_${globalAudio.name}`;
-          if (audioFolder) {
-            audioFolder.file(fileName, globalAudio);
+      // If this is an image scene and the source is local/IDB, export the blob
+      if (newScene.type === 'image') {
+        try {
+          const isRemote = (typeof scene.image === 'string' && (scene.image.startsWith('http://') || scene.image.startsWith('https://')));
+          if (!isRemote) {
+            const key = scene.imageStorageKey || ('image_scene_' + sceneId);
+            const rec = await this.getImageFromIDB(key);
+            if (rec && rec.blob && imagesFolder) {
+              const baseName = rec.name || (sceneId + '.jpg');
+              const ext = (baseName && /\.[a-zA-Z0-9]{2,5}$/.test(baseName)) ? baseName.match(/\.[a-zA-Z0-9]{2,5}$/)[0] : '.jpg';
+              const cleanName = sanitizeExportFileName(baseName, ext);
+              imagesFolder.file(cleanName, rec.blob);
+              newScene.image = './images/' + cleanName;
+            }
           }
-          normalizedAudio = `./audio/${fileName}`;
-        } else if (typeof globalAudio === "string") {
-          // It's a URL string, keep as-is
-          normalizedAudio = globalAudio;
-        }
+        } catch(_) { /* ignore */ }
+      }
 
-        if (normalizedAudio) {
+      // If this is a video scene and the source is a blob URL or local, try to export the actual file from IDB
+      if (newScene.type === 'video') {
+        try {
+          const isBlobUrl = typeof scene.videoSrc === 'string' && scene.videoSrc.startsWith('blob:');
+          const isDataUrl = typeof scene.videoSrc === 'string' && scene.videoSrc.startsWith('data:');
+          if (isBlobUrl || isDataUrl || scene.videoStorageKey) {
+            const db = await this.openVideoDB();
+            if (db) {
+              const rec = await this.getVideoFromIDB(scene.videoStorageKey || sceneId);
+              if (rec && rec.blob) {
+                const vFolder = videosFolder;
+                if (vFolder) {
+                  const baseName = rec.name || scene.videoFileName || (sceneId + '.mp4');
+                  const ext = (baseName && /\.[a-zA-Z0-9]{2,5}$/.test(baseName)) ? baseName.match(/\.[a-zA-Z0-9]{2,5}$/)[0] : ".mp4";
+                  const cleanName = sanitizeExportFileName(baseName, ext);
+                  vFolder.file(cleanName, rec.blob);
+                  newScene.videoSrc = './videos/' + cleanName;
+                }
+              }
+            }
+          }
+        } catch (_) { /* ignore export video failure, keep original src */ }
+      }
+
+      // Handle global sound (export blobs/IDB to files)
+      if (scene.globalSound && scene.globalSound.enabled) {
+        const gs = scene.globalSound;
+        let outPath = null;
+        try {
+          if (gs.audio instanceof File) {
+            const baseName = sanitizeExportFileName(`global_${sceneId}_` + (gs.audio.name || 'audio.mp3'), '.mp3');
+            if (audioFolder) audioFolder.file(baseName, gs.audio);
+            outPath = './audio/' + baseName;
+          } else if (typeof gs.audio === 'string') {
+            if (gs.audio.startsWith('http://') || gs.audio.startsWith('https://')) {
+              outPath = gs.audio; // keep remote URLs
+            } else if (gs.audio.startsWith('./audio/')) {
+              outPath = gs.audio; // already a packaged path
+            } else if (gs.audio.startsWith('blob:') || gs.audio.startsWith('data:') || gs.audioStorageKey) {
+              // Prefer IDB when available
+              let rec = null;
+              if (gs.audioStorageKey) {
+                try { rec = await this.getAudioFromIDB(gs.audioStorageKey); } catch(_) {}
+              }
+              if (rec && rec.blob) {
+                const baseName = sanitizeExportFileName(gs.audioFileName || (`global_${sceneId}.mp3`), '.mp3');
+                if (audioFolder) audioFolder.file(baseName, rec.blob);
+                outPath = './audio/' + baseName;
+              } else {
+                // Fallback: fetch blob/data URL and write it
+                try {
+                  const resp = await fetch(gs.audio);
+                  const blob = await resp.blob();
+                  const baseName = sanitizeExportFileName(gs.audioFileName || (`global_${sceneId}.mp3`), '.mp3');
+                  if (audioFolder) audioFolder.file(baseName, blob);
+                  outPath = './audio/' + baseName;
+                } catch(_) { /* keep null */ }
+              }
+            }
+          }
+        } catch(_) { /* ignore */ }
+        if (outPath) {
           newScene.globalSound = {
-            audio: normalizedAudio,
-            volume: scene.globalSound.volume || 0.5,
+            audio: outPath,
+            volume: gs.volume || 0.5,
             enabled: true,
           };
         }
@@ -3192,19 +4224,47 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
             audio: null,
           };
 
-          // Handle audio properly
-          if (origHotspot.audio && origHotspot.audio instanceof File) {
-            // It's a File object, save to audio folder and update path
-            const fileName = `${sceneId}_${origHotspot.id}_${origHotspot.audio.name}`;
-            if (audioFolder) {
-              audioFolder.file(fileName, origHotspot.audio);
-            }
-            newHotspot.audio = `./audio/${fileName}`;
-          } else if (typeof origHotspot.audio === "string") {
-            // It's a URL string, keep as-is
-            newHotspot.audio = origHotspot.audio;
+          // Handle audio properly (export blobs/IDB to files)
+          if (origHotspot.audio) {
+            try {
+              if (origHotspot.audio instanceof File) {
+                const baseName = sanitizeExportFileName(`${sceneId}_${origHotspot.id}_` + (origHotspot.audio.name || 'audio.mp3'), '.mp3');
+                if (audioFolder) audioFolder.file(baseName, origHotspot.audio);
+                newHotspot.audio = './audio/' + baseName;
+              } else if (typeof origHotspot.audio === 'string') {
+                if (origHotspot.audio.startsWith('http://') || origHotspot.audio.startsWith('https://')) {
+                  newHotspot.audio = origHotspot.audio; // remote URL
+                } else if (origHotspot.audio.startsWith('./audio/')) {
+                  newHotspot.audio = origHotspot.audio; // packaged path
+                } else if (origHotspot.audio.startsWith('blob:') || origHotspot.audio.startsWith('data:') || origHotspot.audioStorageKey) {
+                  // Prefer IDB when available
+                  let rec = null;
+                  if (origHotspot.audioStorageKey) {
+                    try { rec = await this.getAudioFromIDB(origHotspot.audioStorageKey); } catch(_) {}
+                  }
+                  if (rec && rec.blob) {
+                    const baseName = sanitizeExportFileName(origHotspot.audioFileName || `${sceneId}_${origHotspot.id}.mp3`, '.mp3');
+                    if (audioFolder) audioFolder.file(baseName, rec.blob);
+                    newHotspot.audio = './audio/' + baseName;
+                  } else {
+                    // Fallback: fetch blob/data URL and write it
+                    try {
+                      const resp = await fetch(origHotspot.audio);
+                      const blob = await resp.blob();
+                      const baseName = sanitizeExportFileName(origHotspot.audioFileName || `${sceneId}_${origHotspot.id}.mp3`, '.mp3');
+                      if (audioFolder) audioFolder.file(baseName, blob);
+                      newHotspot.audio = './audio/' + baseName;
+                    } catch(_) {
+                      newHotspot.audio = null;
+                    }
+                  }
+                } else {
+                  // Unknown relative; keep as-is
+                  newHotspot.audio = origHotspot.audio;
+                }
+              }
+            } catch(_) { newHotspot.audio = null; }
           } else {
-            // null or undefined
             newHotspot.audio = null;
           }
 
@@ -3254,7 +4314,21 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
             ) {
               newHotspot.imageAspectRatio = origHotspot._aspectRatio;
             }
-            if (origHotspot.image instanceof File) {
+            // Prefer IndexedDB record when available (supports legacy fallback key)
+            const effImageKey = origHotspot.imageStorageKey || (typeof origHotspot.id === 'number' ? `image_hotspot_${origHotspot.id}` : null);
+            if (effImageKey) {
+              try {
+                const rec = await this.getImageFromIDB(effImageKey);
+                if (rec && rec.blob && imagesFolder) {
+                  const baseName = rec.name || `${sceneId}_${origHotspot.id}.png`;
+                  const ext = (baseName && /\.[a-zA-Z0-9]{2,5}$/.test(baseName)) ? baseName.match(/\.[a-zA-Z0-9]{2,5}$/)[0] : '.png';
+                  const cleanName = baseName.replace(/[^a-zA-Z0-9._-]/g, '_');
+                  imagesFolder.file(cleanName, rec.blob);
+                  newHotspot.image = `./images/${cleanName}`;
+                }
+              } catch(_) { /* try other strategies below */ }
+            }
+            if (!newHotspot.image && origHotspot.image instanceof File) {
               const cleanName = origHotspot.image.name.replace(
                 /[^a-zA-Z0-9._-]/g,
                 "_"
@@ -3270,6 +4344,19 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
               if (origHotspot.image.startsWith("data:")) {
                 // data URL -> keep inline for portability
                 newHotspot.image = origHotspot.image;
+              } else if (origHotspot.image.startsWith('blob:')) {
+                // Blob URL from current session – fetch and package into images folder
+                try {
+                  const resp = await fetch(origHotspot.image);
+                  if (resp.ok) {
+                    const blob = await resp.blob();
+                    if (imagesFolder) {
+                      const baseName = (origHotspot.imageFileName && origHotspot.imageFileName.replace(/[^a-zA-Z0-9._-]/g, '_')) || `${sceneId}_${origHotspot.id}.png`;
+                      imagesFolder.file(baseName, blob);
+                      newHotspot.image = `./images/${baseName}`;
+                    }
+                  }
+                } catch(_) { /* if fetch fails, leave unset to avoid broken refs */ }
               } else if (/^https?:\/\//i.test(origHotspot.image)) {
                 newHotspot.image = origHotspot.image; // remote URL
               } else if (origHotspot.image.startsWith("./images/")) {
@@ -3327,22 +4414,16 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
   loadTemplate() {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = ".json,.zip";
+    input.accept = ".zip";
 
     input.addEventListener("change", (e) => {
       const file = e.target.files[0];
       if (!file) return;
 
-      if (file.name.endsWith(".json")) {
-        this.loadJSONTemplate(file);
-      } else if (file.name.endsWith(".zip")) {
-        alert(
-          "ZIP project loading will extract to your downloads. Open the index.html file from the extracted folder."
-        );
-        // For ZIP files, user needs to extract manually and open index.html
-        // This is the simplest approach for now
+      if (file.name.endsWith(".zip")) {
+        this.loadZIPTemplate(file);
       } else {
-        alert("Please select a JSON template file or ZIP project file.");
+        alert("Please select a ZIP template file.");
       }
     });
 
@@ -3392,6 +4473,268 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
       }
     };
     reader.readAsText(file);
+  }
+
+  async loadZIPTemplate(file) {
+    try {
+      this.showLoadingIndicator("Loading template from ZIP...");
+      
+      // Load JSZip library
+      const JSZip = window.JSZip || (await this.loadJSZip());
+      
+      // Read the ZIP file
+      const arrayBuffer = await file.arrayBuffer();
+      const zip = await JSZip.loadAsync(arrayBuffer);
+      
+      // Extract config.json
+      const configFile = zip.file("config.json");
+      if (!configFile) {
+        throw new Error("Invalid template: config.json not found");
+      }
+      
+      const configText = await configFile.async("text");
+      const config = JSON.parse(configText);
+      
+      // Clear existing editor state (without confirmation for template load)
+      const container = document.getElementById("hotspot-container");
+      if (container) container.innerHTML = "";
+      this.hotspots = [];
+      
+      // Clear all old assets from IndexedDB before loading new ones (Replace behavior)
+      await this.clearAllVideosFromIDB();
+      if (typeof this.clearAllImagesFromIDB === 'function') {
+        await this.clearAllImagesFromIDB();
+      }
+      if (typeof this.clearAllAudiosFromIDB === 'function') {
+        await this.clearAllAudiosFromIDB();
+      }
+      
+      // Load scenes and custom styles
+      this.scenes = config.scenes || {};
+      this.currentScene = config.currentScene || Object.keys(this.scenes)[0] || "scene1";
+      this.customStyles = config.customStyles || this.customStyles;
+      
+  // Process images, videos, and audio from ZIP and store in IndexedDB
+      const imagePromises = [];
+      const videoPromises = [];
+      const audioPromises = [];
+      
+      // Extract and convert all scene images
+      for (const [sceneId, scene] of Object.entries(this.scenes)) {
+        if (scene.type === "image" && scene.image) {
+          // If image is embedded as data URL in config, convert directly
+          if (typeof scene.image === 'string' && scene.image.startsWith('data:')) {
+            imagePromises.push((async () => {
+              try {
+                const resp = await fetch(scene.image);
+                const blob = await resp.blob();
+                const fileName = `${sceneId}.jpg`;
+                const storageKey = scene.imageStorageKey || `image_scene_${sceneId}`;
+                await this.saveImageToIDB(storageKey, new File([blob], fileName, { type: blob.type || 'image/jpeg' }));
+                const blobUrl = URL.createObjectURL(blob);
+                scene.image = blobUrl;
+                scene.imageStorageKey = storageKey;
+                scene.imageFileName = fileName;
+              } catch(_) {}
+            })());
+          } else {
+            const imagePath = scene.image.replace("./images/", "");
+            const imageFile = zip.file(`images/${imagePath}`);
+            if (imageFile) {
+              imagePromises.push(
+                imageFile.async("blob").then(async (blob) => {
+                  try {
+                    const file = new File([blob], imagePath, { type: blob.type || 'image/png' });
+                    const storageKey = scene.imageStorageKey || `image_scene_${sceneId}`;
+                    await this.saveImageToIDB(storageKey, file);
+                    const blobUrl = URL.createObjectURL(blob);
+                    scene.image = blobUrl;
+                    scene.imageStorageKey = storageKey;
+                    scene.imageFileName = imagePath;
+                  } catch(_) { /* ignore image store failure */ }
+                })
+              );
+            }
+          }
+        } else if (scene.type === "video" && scene.videoSrc) {
+          const videoPath = scene.videoSrc.replace("./videos/", "");
+          const videoFile = zip.file(`videos/${videoPath}`);
+          
+          if (videoFile) {
+            videoPromises.push(
+              videoFile.async("blob").then(async (blob) => {
+                // Store video in IndexedDB with proper storage key
+                const storageKey = sceneId;
+                const file = new File([blob], videoPath, { type: blob.type || "video/mp4" });
+                await this.saveVideoToIDB(storageKey, file);
+                
+                // Create blob URL for immediate use
+                const blobUrl = URL.createObjectURL(blob);
+                scene.videoSrc = blobUrl;
+                scene.videoStorageKey = storageKey; // Use the standard key name
+                scene.videoFileName = videoPath;
+              })
+            );
+          }
+        }
+      }
+      
+      // Extract hotspot images
+      for (const scene of Object.values(this.scenes)) {
+        if (scene.hotspots) {
+          for (const hotspot of scene.hotspots) {
+            if (hotspot.type === "image" && hotspot.image) {
+              if (typeof hotspot.image === 'string' && hotspot.image.startsWith('data:')) {
+                imagePromises.push((async () => {
+                  try {
+                    const resp = await fetch(hotspot.image);
+                    const blob = await resp.blob();
+                    const fileName = hotspot.imageFileName || `hotspot_${hotspot.id}.png`;
+                    const storageKey = hotspot.imageStorageKey || `image_hotspot_${scene.name || 'scene'}_${hotspot.id}`;
+                    await this.saveImageToIDB(storageKey, new File([blob], fileName, { type: blob.type || 'image/png' }));
+                    const blobUrl = URL.createObjectURL(blob);
+                    hotspot.image = blobUrl;
+                    hotspot.imageStorageKey = storageKey;
+                    hotspot.imageFileName = fileName;
+                  } catch(_) {}
+                })());
+              } else if (typeof hotspot.image === 'string' && hotspot.image.startsWith("./images/")) {
+                const imagePath = hotspot.image.replace("./images/", "");
+                const imageFile = zip.file(`images/${imagePath}`);
+                if (imageFile) {
+                  imagePromises.push(
+                    imageFile.async("blob").then(async (blob) => {
+                      try {
+                        const file = new File([blob], imagePath, { type: blob.type || 'image/png' });
+                        const storageKey = hotspot.imageStorageKey || `image_hotspot_${scene.name || 'scene'}_${hotspot.id}`;
+                        await this.saveImageToIDB(storageKey, file);
+                        const blobUrl = URL.createObjectURL(blob);
+                        hotspot.image = blobUrl;
+                        hotspot.imageStorageKey = storageKey;
+                        hotspot.imageFileName = imagePath;
+                      } catch(_) { /* ignore */ }
+                    })
+                  );
+                }
+              }
+            }
+
+            // Extract hotspot audio (file path or data URL)
+            if ((hotspot.type === 'audio' || hotspot.type === 'text-audio') && hotspot.audio) {
+              if (typeof hotspot.audio === 'string' && hotspot.audio.startsWith('data:')) {
+                audioPromises.push((async () => {
+                  try {
+                    const resp = await fetch(hotspot.audio);
+                    const blob = await resp.blob();
+                    const base = hotspot.audioFileName || `hotspot_${hotspot.id}.mp3`;
+                    const storageKey = hotspot.audioStorageKey || `audio_hotspot_${scene.name || 'scene'}_${hotspot.id}`;
+                    await this.saveAudioToIDB(storageKey, new File([blob], base, { type: blob.type || 'audio/mpeg' }));
+                    const blobUrl = URL.createObjectURL(blob);
+                    hotspot.audio = blobUrl;
+                    hotspot.audioStorageKey = storageKey;
+                    hotspot.audioFileName = base;
+                  } catch(_) {}
+                })());
+              } else if (typeof hotspot.audio === 'string' && hotspot.audio.startsWith('./audio/')) {
+                const audioPath = hotspot.audio.replace('./audio/', '');
+                const audioFile = zip.file(`audio/${audioPath}`);
+                if (audioFile) {
+                  audioPromises.push(
+                    audioFile.async('blob').then(async (blob) => {
+                      try {
+                        const file = new File([blob], audioPath, { type: blob.type || 'audio/mpeg' });
+                        const storageKey = hotspot.audioStorageKey || `audio_hotspot_${scene.name || 'scene'}_${hotspot.id}`;
+                        await this.saveAudioToIDB(storageKey, file);
+                        const blobUrl = URL.createObjectURL(blob);
+                        hotspot.audio = blobUrl;
+                        hotspot.audioStorageKey = storageKey;
+                        hotspot.audioFileName = audioPath;
+                      } catch(_) {}
+                    })
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Extract global scene audio
+      for (const [sceneId, scene] of Object.entries(this.scenes)) {
+        if (scene.globalSound && scene.globalSound.audio) {
+          const gs = scene.globalSound;
+          if (typeof gs.audio === 'string' && gs.audio.startsWith('data:')) {
+            audioPromises.push((async () => {
+              try {
+                const resp = await fetch(gs.audio);
+                const blob = await resp.blob();
+                const base = gs.audioFileName || `${sceneId}.mp3`;
+                const storageKey = gs.audioStorageKey || `audio_global_${sceneId}`;
+                await this.saveAudioToIDB(storageKey, new File([blob], base, { type: blob.type || 'audio/mpeg' }));
+                const blobUrl = URL.createObjectURL(blob);
+                gs.audio = blobUrl;
+                gs.audioStorageKey = storageKey;
+                gs.audioFileName = base;
+              } catch(_) {}
+            })());
+          } else if (typeof gs.audio === 'string' && gs.audio.startsWith('./audio/')) {
+            const audioPath = gs.audio.replace('./audio/', '');
+            const audioFile = zip.file(`audio/${audioPath}`);
+            if (audioFile) {
+              audioPromises.push(
+                audioFile.async('blob').then(async (blob) => {
+                  try {
+                    const file = new File([blob], audioPath, { type: blob.type || 'audio/mpeg' });
+                    const storageKey = gs.audioStorageKey || `audio_global_${sceneId}`;
+                    await this.saveAudioToIDB(storageKey, file);
+                    const blobUrl = URL.createObjectURL(blob);
+                    gs.audio = blobUrl;
+                    gs.audioStorageKey = storageKey;
+                    gs.audioFileName = audioPath;
+                  } catch(_) {}
+                })
+              );
+            }
+          }
+        }
+      }
+      
+      // Wait for all assets to be processed
+  await Promise.all([...imagePromises, ...videoPromises, ...audioPromises]);
+      
+      // Debug: Log loaded scenes structure
+      console.log('Loaded scenes from ZIP:', this.scenes);
+      console.log('Current scene:', this.currentScene);
+      if (this.scenes[this.currentScene]) {
+        console.log('Current scene hotspots:', this.scenes[this.currentScene].hotspots);
+      }
+      
+      // IMPORTANT: Load current scene's hotspots into this.hotspots BEFORE saving
+      // Otherwise saveScenesData() will overwrite scene hotspots with empty array
+      const currentScene = this.scenes[this.currentScene];
+      if (currentScene && Array.isArray(currentScene.hotspots)) {
+        this.hotspots = [...currentScene.hotspots];
+        console.log('Loaded hotspots into editor:', this.hotspots);
+      }
+      
+      // Save to localStorage and update UI
+      this.saveCSSToLocalStorage();
+      this.saveScenesData();
+      this.updateSceneDropdown();
+      this.loadCurrentScene();
+      this.updateHotspotList();
+      this.updateNavigationTargets();
+      this.updateStartingPointInfo();
+      this.applyStylesToExistingElements();
+      
+      this.hideLoadingIndicator();
+      alert(`Template "${config.name || 'Untitled'}" loaded successfully!`);
+      
+    } catch (error) {
+      this.hideLoadingIndicator();
+      console.error("Error loading ZIP template:", error);
+      alert("Error loading template: " + error.message);
+    }
   }
 
   // CSS Customization Methods
@@ -3499,13 +4842,6 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
 
     // Update button images
     if (styles.buttonImages) {
-      // Update navigation portal images
-      document
-        .querySelectorAll('a-image[src="#hotspot"], a-image[src*="up-arrow"]')
-        .forEach((portal) => {
-          portal.setAttribute("src", styles.buttonImages.portal);
-        });
-
       // Update play button images
       document
         .querySelectorAll('a-image[src="#play"], a-image[src*="play.png"]')
@@ -3778,14 +5114,118 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
       this.scenes[this.currentScene].hotspots = [...this.hotspots];
     }
 
+    // Clone scenes and strip non-persistable blob: URLs for videos and images
+    const scenesClone = JSON.parse(JSON.stringify(this.scenes));
+    try {
+      Object.values(scenesClone || {}).forEach((sc) => {
+        if (!sc) return;
+        if (sc.type === 'video' && typeof sc.videoSrc === 'string' && sc.videoSrc.startsWith('blob:')) {
+          sc.videoSrc = null; // don’t persist ephemeral blob URLs
+        }
+        if (sc.type === 'image') {
+          if (sc.imageStorageKey && typeof sc.image === 'string' && sc.image.startsWith('blob:')) {
+            // Strip blob URL for images stored in IDB
+            sc.image = null;
+          }
+        }
+        // Global sound: strip blob if stored in IDB
+        if (sc.globalSound && sc.globalSound.audioStorageKey && typeof sc.globalSound.audio === 'string' && sc.globalSound.audio.startsWith('blob:')) {
+          sc.globalSound.audio = null;
+        }
+        // Also sanitize any image hotspot blobs
+        if (Array.isArray(sc.hotspots)) {
+          sc.hotspots.forEach(h => {
+            if (h && h.type === 'image') {
+              if (h.imageStorageKey && typeof h.image === 'string' && h.image.startsWith('blob:')) {
+                h.image = null;
+              }
+            } else if (h && (h.type === 'audio' || h.type === 'text-audio')) {
+              if (h.audioStorageKey && typeof h.audio === 'string' && h.audio.startsWith('blob:')) {
+                h.audio = null;
+              }
+            }
+          });
+        }
+      });
+    } catch (_) { /* ignore */ }
+
+    // Also persist a sanitized copy of the current scene's hotspots to avoid stale blob: URLs
+    const sanitizedCurrentHotspots = (scenesClone[this.currentScene] && scenesClone[this.currentScene].hotspots)
+      ? JSON.parse(JSON.stringify(scenesClone[this.currentScene].hotspots))
+      : [];
+
     const scenesData = {
-      scenes: this.scenes,
+      scenes: scenesClone,
       currentScene: this.currentScene,
-      hotspots: this.hotspots,
+      hotspots: sanitizedCurrentHotspots,
     };
 
     localStorage.setItem("vr-hotspot-scenes-data", JSON.stringify(scenesData));
     console.log("✅ Saved scenes data to localStorage");
+  }
+
+  async rehydrateImageSourcesFromIDB() {
+    try {
+      const entries = Object.entries(this.scenes || {});
+      if (!entries.length) return;
+      let changed = false;
+      for (const [sceneId, scene] of entries) {
+        if (!scene || scene.type !== 'image') continue;
+        // Only rehydrate if we have a storage key and not an explicit remote/data URL
+        const hasRemote = (typeof scene.image === 'string' && (scene.image.startsWith('http://') || scene.image.startsWith('https://') || scene.image.startsWith('data:')));
+        if (!scene.imageStorageKey || hasRemote) continue;
+        const key = scene.imageStorageKey || ('image_scene_' + sceneId);
+        const rec = await this.getImageFromIDB(key);
+        if (rec && rec.blob) {
+          try {
+            const url = URL.createObjectURL(rec.blob);
+            scene.image = url;
+            if (!scene.imageFileName) scene.imageFileName = rec.name || '';
+            changed = true;
+          } catch (_) { /* ignore */ }
+        }
+      }
+      if (changed) this.saveScenesData();
+    } catch (_) { /* ignore */ }
+  }
+
+  async rehydrateAudioSourcesFromIDB() {
+    try {
+      const entries = Object.entries(this.scenes || {});
+      if (!entries.length) return;
+      let changed = false;
+      for (const [sceneId, scene] of entries) {
+        if (!scene) continue;
+        // Global sound first
+        if (scene.globalSound && scene.globalSound.audioStorageKey) {
+          try {
+            const rec = await this.getAudioFromIDB(scene.globalSound.audioStorageKey);
+            if (rec && rec.blob) {
+              scene.globalSound.audio = URL.createObjectURL(rec.blob);
+              if (!scene.globalSound.audioFileName) scene.globalSound.audioFileName = rec.name || '';
+              changed = true;
+            }
+          } catch (_) {}
+        }
+        // Hotspots
+        if (Array.isArray(scene.hotspots)) {
+          for (const h of scene.hotspots) {
+            if (!h) continue;
+            if ((h.type === 'audio' || h.type === 'text-audio') && h.audioStorageKey) {
+              try {
+                const rec = await this.getAudioFromIDB(h.audioStorageKey);
+                if (rec && rec.blob) {
+                  h.audio = URL.createObjectURL(rec.blob);
+                  if (!h.audioFileName) h.audioFileName = rec.name || '';
+                  changed = true;
+                }
+              } catch (_) {}
+            }
+          }
+        }
+      }
+      if (changed) this.saveScenesData();
+    } catch (_) { /* ignore */ }
   }
 
   // Persist aspect ratio for a specific image hotspot and optionally update both editor and scene copies
@@ -3827,7 +5267,36 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
         this.currentScene = data.currentScene || this.currentScene;
         this.hotspots = data.hotspots || [];
 
-        // Seed any missing imageAspectRatio from legacy _aspectRatio to maintain continuity
+        // Sanitize any stale blob: URLs in loaded hotspots (rehydrated later from IDB)
+        try {
+          if (Array.isArray(this.hotspots)) {
+            this.hotspots.forEach((h) => {
+              if (!h) return;
+              if (h.type === 'image' && h.imageStorageKey && typeof h.image === 'string' && h.image.startsWith('blob:')) {
+                h.image = null;
+              }
+              if ((h.type === 'audio' || h.type === 'text-audio') && h.audioStorageKey && typeof h.audio === 'string' && h.audio.startsWith('blob:')) {
+                h.audio = null;
+              }
+            });
+          }
+        } catch (_) { /* ignore */ }
+
+        // Migrate old scenes to include type field (backward compatibility)
+        Object.values(this.scenes || {}).forEach((scene) => {
+          if (!scene.type) {
+            scene.type = "image"; // Default to image for existing scenes
+          }
+          if (scene.videoVolume === undefined) {
+            scene.videoVolume = 0.5; // Default video volume
+          }
+          // Clear any stale blob URLs so we won’t try to load invalid sources after refresh
+          if (scene.type === 'video' && typeof scene.videoSrc === 'string' && scene.videoSrc.startsWith('blob:')) {
+            scene.videoSrc = null;
+          }
+        });
+
+  // Seed any missing imageAspectRatio from legacy _aspectRatio to maintain continuity
         try {
           const seed = (arr) => {
             if (!Array.isArray(arr)) return;
@@ -4101,11 +5570,12 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
 
       <a-assets>
         <img id="main-panorama" src="./images/scene1.jpg" />
-        <img id="hotspot" src="./images/up-arrow.png" />
         <audio id="default-audio" src="./audio/music.mp3"></audio>
         <img id="close" src="./images/close.png" />
         <img id="play" src="./images/play.png" />
         <img id="pause" src="./images/pause.png" />
+        <!-- Video asset for 360° video scenes -->
+        <video id="scene-video-dynamic" crossorigin="anonymous" loop muted playsinline webkit-playsinline style="display:none"></video>
       </a-assets>
 
       <a-entity id="hotspot-container"></a-entity>
@@ -4191,6 +5661,59 @@ Generated by VR Hotspot Editor on ${new Date().toLocaleDateString()}
         </a-entity>
       </a-entity>
     </a-scene>
+
+    <!-- Video Controls (appears only for video scenes) -->
+    <div id="video-controls" style="
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.8);
+      padding: 15px 25px;
+      border-radius: 30px;
+      display: none;
+      gap: 15px;
+      align-items: center;
+      z-index: 1001;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+    ">
+      <button id="video-play-pause" style="
+        background: #007bff;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 20px;
+        cursor: pointer;
+        font-size: 16px;
+        font-weight: bold;
+      ">⏸ Pause</button>
+      
+      <button id="video-mute" style="
+        background: #28a745;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 20px;
+        cursor: pointer;
+        font-size: 16px;
+      ">🔇 Muted</button>
+      
+      <div style="color: white; font-size: 14px;">
+        <span id="video-time-current">0:00</span> / <span id="video-time-total">0:00</span>
+      </div>
+      
+      <input type="range" id="video-progress" min="0" max="100" value="0" style="
+        width: 200px;
+        height: 6px;
+        cursor: pointer;
+      ">
+      
+      <input type="range" id="video-volume" min="0" max="100" value="50" style="
+        width: 100px;
+        height: 6px;
+        cursor: pointer;
+      " title="Volume">
+    </div>
   </body>
 </html>`;
   }
@@ -4402,6 +5925,7 @@ const CUSTOM_STYLES = ${customStylesJson};
 
 // Helper (export build): reuse caching via local map to prevent reprocessing
 const EXPORTED_IMAGE_MASK_CACHE = new Map();
+const EXPORTED_VIDEO_THUMB_CACHE = new Map();
 function applyRoundedMaskToAImage(aImgEl, styleCfg) {
   return new Promise(resolve => {
     try {
@@ -4676,7 +6200,29 @@ AFRAME.registerComponent("hotspot", {
   createAudio: function(data) {
     const el = this.el;
     const audioEl = document.createElement("a-sound");
-    audioEl.setAttribute("src", data.audio);
+    // Stabilize blob/data audio by routing through <a-assets>
+    let aSrc = data.audio;
+    if (typeof aSrc === 'string' && (aSrc.startsWith('blob:') || aSrc.startsWith('data:'))) {
+      try {
+        const assets = document.querySelector('a-assets') || (function(){
+          const scn = document.querySelector('a-scene') || document.querySelector('scene, a-scene');
+          const a = document.createElement('a-assets');
+          if (scn) scn.insertBefore(a, scn.firstChild);
+          return a;
+        })();
+  const assetId = "audio_rt_" + (el.id || ("el_" + Math.random().toString(36).slice(2)));
+  let assetEl = assets.querySelector("#" + assetId);
+        if (!assetEl) {
+          assetEl = document.createElement('audio');
+          assetEl.setAttribute('id', assetId);
+          assetEl.setAttribute('crossorigin', 'anonymous');
+          assets.appendChild(assetEl);
+        }
+        assetEl.setAttribute('src', aSrc);
+  aSrc = "#" + assetId;
+      } catch(_) { /* ignore, fallback to direct src */ }
+    }
+    audioEl.setAttribute("src", aSrc);
     audioEl.setAttribute("autoplay", "false");
     audioEl.setAttribute("loop", "true");
     el.appendChild(audioEl);
@@ -4732,6 +6278,49 @@ class HotspotProject {
   this.weblinkFrame = null;
   this.wasInVRBeforeWeblink = false;
     this.loadProject();
+  }
+
+  async _ensureVideoPreviewExport(sceneId){
+    try {
+      if (EXPORTED_VIDEO_THUMB_CACHE.has(sceneId)) return EXPORTED_VIDEO_THUMB_CACHE.get(sceneId);
+      const sc = this.scenes[sceneId];
+      if (!sc || sc.type !== 'video' || !sc.videoSrc) return null;
+      const vid = document.createElement('video');
+      vid.preload = 'metadata';
+      vid.muted = true;
+      vid.playsInline = true;
+      vid.crossOrigin = '';
+      const run = new Promise((resolve) => {
+        let settled = false;
+        const cleanup = () => { try { vid.src = ''; vid.load && vid.load(); } catch(_) {} };
+        vid.addEventListener('loadedmetadata', () => {
+          try {
+            const target = Math.min(1, (vid.duration || 1) * 0.1);
+            const onSeeked = () => {
+              try {
+                const w = 512;
+                const ratio = (vid.videoHeight || 1) / (vid.videoWidth || 1);
+                const h = Math.max(1, Math.round(w * ratio));
+                const canvas = document.createElement('canvas');
+                canvas.width = w; canvas.height = h;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(vid, 0, 0, w, h);
+                const url = canvas.toDataURL('image/png');
+                EXPORTED_VIDEO_THUMB_CACHE.set(sceneId, url);
+                settled = true;
+                resolve(url);
+              } catch(_) { resolve(null); }
+              cleanup();
+            };
+            try { vid.currentTime = isFinite(target) ? target : 0.1; } catch(_) { vid.currentTime = 0.1; }
+            vid.addEventListener('seeked', onSeeked, { once: true });
+          } catch(_) { resolve(null); cleanup(); }
+        }, { once: true });
+        vid.addEventListener('error', () => { if (!settled) resolve(null); cleanup(); }, { once: true });
+      });
+      vid.src = sc.videoSrc;
+      return await run;
+    } catch(_) { return null; }
   }
 
   async loadProject() {
@@ -4799,6 +6388,21 @@ class HotspotProject {
     // Show a loading indicator
     this.showLoadingIndicator();
 
+    // Check if this is a video scene
+    if (scene.type === 'video' && scene.videoSrc) {
+      // Handle video scene
+      this.loadVideoScene(sceneId, scene, skybox);
+      return;
+    }
+
+    // Ensure any existing videosphere is removed when switching to an image scene
+    const existingVideosphere = document.getElementById('current-videosphere');
+    if (existingVideosphere && existingVideosphere.parentNode) {
+      existingVideosphere.parentNode.removeChild(existingVideosphere);
+    }
+    // Hide and reset video controls/state for image scenes
+    this.hideVideoControls();
+
     // (runtime) no editor hotspot list or id counter to manage
     
     // Prefer preloaded asset if available for instant swap
@@ -4845,6 +6449,9 @@ class HotspotProject {
 
         // Hide the loading indicator
         this.hideLoadingIndicator();
+        
+        // Hide video controls for image scenes
+        this.hideVideoControls();
       }, 100);
       
       this.currentScene = sceneId;
@@ -4916,6 +6523,9 @@ class HotspotProject {
 
         // Hide the loading indicator
         this.hideLoadingIndicator();
+        
+        // Hide video controls for image scenes
+        this.hideVideoControls();
       }, 100);
     };
     
@@ -4942,6 +6552,202 @@ class HotspotProject {
     // We've replaced this with the preloadImage.onerror handler above
     
     this.currentScene = sceneId;
+  }
+
+  loadVideoScene(sceneId, scene, skybox) {
+    console.log('Loading video scene:', sceneId, scene.videoSrc);
+    
+    // Hide skybox, we'll use videosphere instead
+    skybox.setAttribute('visible', 'false');
+    
+    // Remove any existing videosphere
+    const existingVideosphere = document.getElementById('current-videosphere');
+    if (existingVideosphere) {
+      existingVideosphere.parentNode.removeChild(existingVideosphere);
+    }
+    
+    // Get or create video element
+    let videoEl = document.getElementById('scene-video-dynamic');
+    if (!videoEl) {
+      console.warn('Video element not found in assets');
+      this.hideLoadingIndicator();
+      return;
+    }
+    
+    // Set video source
+    videoEl.src = scene.videoSrc;
+    videoEl.volume = scene.videoVolume !== undefined ? scene.videoVolume : 0.5;
+    videoEl.loop = true;
+    videoEl.muted = true; // Start muted for autoplay
+    
+    // Create videosphere element
+  const videosphere = document.createElement('a-videosphere');
+    videosphere.id = 'current-videosphere';
+    videosphere.setAttribute('src', '#scene-video-dynamic');
+  // Align videosphere yaw with expected orientation (match editor behavior)
+  videosphere.setAttribute('rotation', '0 -90 0');
+    
+    // Add to scene
+    const aScene = document.querySelector('a-scene');
+    aScene.appendChild(videosphere);
+    
+    // Wait for video to be ready
+    const onVideoReady = () => {
+      console.log('Video ready to play');
+      
+      videoEl.play().then(() => {
+        console.log('Video playing');
+        
+        // Hide loading environment
+        const loadingEnvironment = document.getElementById('loading-environment');
+        if (loadingEnvironment) {
+          loadingEnvironment.setAttribute('visible', 'false');
+        }
+        
+        // Create hotspots
+        const container = document.getElementById('hotspot-container');
+        container.innerHTML = '';
+        this.createHotspots(scene.hotspots);
+        
+        // Apply starting point
+        setTimeout(() => {
+          this.applyStartingPoint(scene);
+          
+          // Play global sound for this scene
+          setTimeout(() => {
+            this.playCurrentGlobalSound();
+          }, 500);
+        }, 100);
+        
+        // Notify scene loaded
+        try { 
+          const ev = new CustomEvent('vrhotspots:scene-loaded'); 
+          window.dispatchEvent(ev); 
+        } catch(e) {}
+        
+        // Setup video controls
+        this.updateVideoControls();
+        
+        // Hide loading indicator
+        this.hideLoadingIndicator();
+      }).catch(err => {
+        console.error('Error playing video:', err);
+        this.hideLoadingIndicator();
+      });
+    };
+    
+    if (videoEl.readyState >= 2) {
+      onVideoReady();
+    } else {
+      videoEl.addEventListener('loadeddata', onVideoReady, { once: true });
+    }
+    
+    this.currentScene = sceneId;
+  }
+
+  updateVideoControls() {
+    const videoEl = document.getElementById('scene-video-dynamic');
+    const videoControls = document.getElementById('video-controls');
+    const playPauseBtn = document.getElementById('video-play-pause');
+    const muteBtn = document.getElementById('video-mute');
+    const progressBar = document.getElementById('video-progress');
+    const volumeSlider = document.getElementById('video-volume');
+    // HTML uses video-time-current and video-time-total; support both IDs for robustness
+    const currentTimeSpan = document.getElementById('video-time-current') || document.getElementById('video-current-time');
+    const durationSpan = document.getElementById('video-time-total') || document.getElementById('video-duration');
+    
+    if (!videoEl || !videoControls) return;
+    
+    // Show video controls
+    videoControls.style.display = 'block';
+    
+    // Play/Pause button
+    if (playPauseBtn) {
+      playPauseBtn.onclick = () => {
+        if (videoEl.paused) {
+          videoEl.play();
+          playPauseBtn.textContent = '⏸';
+        } else {
+          videoEl.pause();
+          playPauseBtn.textContent = '▶';
+        }
+      };
+    }
+    
+    // Mute button
+    if (muteBtn) {
+      muteBtn.onclick = () => {
+        videoEl.muted = !videoEl.muted;
+        muteBtn.textContent = videoEl.muted ? '🔇' : '🔊';
+      };
+      muteBtn.textContent = videoEl.muted ? '🔇' : '🔊';
+    }
+    
+    // Progress bar
+    if (progressBar) {
+      videoEl.addEventListener('timeupdate', () => {
+        if (videoEl.duration) {
+          const progress = (videoEl.currentTime / videoEl.duration) * 100;
+          progressBar.value = progress;
+          
+          if (currentTimeSpan) {
+            currentTimeSpan.textContent = this.formatTime(videoEl.currentTime);
+          }
+        }
+      });
+      
+      progressBar.addEventListener('input', (e) => {
+        const time = (e.target.value / 100) * videoEl.duration;
+        videoEl.currentTime = time;
+      });
+    }
+    
+    // Volume slider
+    if (volumeSlider) {
+      volumeSlider.value = videoEl.volume * 100;
+      volumeSlider.addEventListener('input', (e) => {
+        videoEl.volume = e.target.value / 100;
+        if (videoEl.volume > 0) {
+          videoEl.muted = false;
+          if (muteBtn) muteBtn.textContent = '🔊';
+        }
+      });
+    }
+    
+    // Duration display
+    if (durationSpan) {
+      const updateDuration = () => {
+        if (videoEl.duration) {
+          durationSpan.textContent = this.formatTime(videoEl.duration);
+        }
+      };
+      if (videoEl.duration) {
+        updateDuration();
+      } else {
+        videoEl.addEventListener('loadedmetadata', updateDuration, { once: true });
+      }
+    }
+  }
+
+  hideVideoControls() {
+    const videoControls = document.getElementById('video-controls');
+    if (videoControls) {
+      videoControls.style.display = 'none';
+    }
+    
+    // Pause and reset video
+    const videoEl = document.getElementById('scene-video-dynamic');
+    if (videoEl) {
+      videoEl.pause();
+      videoEl.currentTime = 0;
+    }
+  }
+
+  formatTime(seconds) {
+    if (!seconds || isNaN(seconds)) return '0:00';
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return \`\${mins}:\${secs.toString().padStart(2, '0')}\`;
   }
 
   getSceneImagePath(imagePath, sceneId) {
@@ -5045,7 +6851,6 @@ class HotspotProject {
   const lblColor = (navStyles && navStyles.labelColor) || '#fff';
   labelText.setAttribute('color', lblColor);
   labelText.setAttribute('width', '5');
-  // labelText.setAttribute('scale', '1.2 1.2 1');
     labelText.setAttribute('position', '0 0 0.01');
     labelGroup.appendChild(labelBg);
     labelGroup.appendChild(labelText);
@@ -5123,7 +6928,26 @@ class HotspotProject {
             } else if (hotspot.type === 'weblink') {
               if (typeof hotspot.weblinkPreview === 'string' && hotspot.weblinkPreview) src = hotspot.weblinkPreview;
             }
-            if (src) {
+            if (src === 'VIDEO_ICON' && hotspot.type === 'navigation') {
+              try {
+                this._ensureVideoPreviewExport(hotspot.navigationTarget).then((thumb) => {
+                  if (thumb && previewEl) {
+                    previewEl.setAttribute('material', 'src', thumb);
+                    previewEl.setAttribute('material', 'transparent', true);
+                    previewEl.setAttribute('material', 'opacity', 1);
+                    previewEl.setAttribute('material', 'shader', 'flat');
+                    previewEl.setAttribute('material', 'side', 'double');
+                    previewEl.setAttribute('material', 'alphaTest', 0.01);
+                  } else {
+                    previewEl.setAttribute('material', 'color', '#000');
+                    previewEl.setAttribute('material', 'transparent', true);
+                    previewEl.setAttribute('material', 'opacity', 0.15);
+                    previewEl.setAttribute('material', 'shader', 'flat');
+                    previewEl.setAttribute('material', 'side', 'double');
+                  }
+                });
+              } catch(_) {}
+            } else if (src) {
               console.log('[Preview][Hover][Export]', { id: hotspot.id, type: hotspot.type, srcType: src.startsWith('data:') ? 'dataURL' : 'url', len: src.length });
               previewEl.setAttribute('material', 'src', src);
               previewEl.setAttribute('material', 'transparent', true);
@@ -5450,6 +7274,12 @@ class HotspotProject {
 
     const loaders = ids.map((id) => {
       const sc = this.scenes[id];
+      // Skip video scenes — they don't need preloaded image assets and would mislead preview logic
+      if (sc && sc.type === 'video') {
+        done++;
+        updateSubtitle(done);
+        return Promise.resolve();
+      }
       const src = this.getSceneImagePath(sc.image, id);
       const assetId = 'asset-panorama-' + id;
       if (document.getElementById(assetId)) { done++; updateSubtitle(done); return Promise.resolve(); }
@@ -5496,11 +7326,14 @@ class HotspotProject {
   }
 
   _getExportPreviewSrc(sceneId){
-    // Prefer preloaded <a-assets> image if available
+    // Check scene type first: video scenes should use VIDEO_ICON path (triggers thumbnail generation)
+    const sc = this.scenes[sceneId]; if (!sc) return null;
+    if (sc.type === 'video') return 'VIDEO_ICON';
+    // For image scenes, prefer preloaded <a-assets> image if available
     const preId = 'asset-panorama-' + sceneId;
     const preEl = document.getElementById(preId);
     if (preEl) return '#' + preId;
-    const sc = this.scenes[sceneId]; if (!sc) return null; const img = sc.image||'';
+    const img = sc.image||'';
     if (img.startsWith('http://')||img.startsWith('https://')) return img;
     if (img.startsWith('./images/')) return img;
     if (img.startsWith('data:')) return './images/' + sceneId + '.jpg';
@@ -5512,7 +7345,21 @@ class HotspotProject {
     const img = document.getElementById('nav-preview-img');
     const cap = document.getElementById('nav-preview-caption');
     const sc = this.scenes[sceneId]; if (!sc) return;
-  const src = this._getExportPreviewSrc(sceneId); if (src) img.src = src;
+  const src = this._getExportPreviewSrc(sceneId);
+  if (src === 'VIDEO_ICON') {
+    try {
+      this._ensureVideoPreviewExport(sceneId).then((thumb) => {
+        if (thumb) {
+          img.src = thumb;
+        } else {
+          const svg = encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="128" height="128"><rect rx="4" ry="4" x="2" y="6" width="14" height="12" fill="#111" stroke="#2ae" stroke-width="2"/><polygon points="16,10 22,7 22,17 16,14" fill="#2ae"/></svg>');
+          img.src = 'data:image/svg+xml;charset=UTF-8,' + svg;
+        }
+      });
+    } catch(_) {}
+  } else if (src) {
+    img.src = src;
+  }
   cap.textContent = 'Go to: ' + (sc.name || sceneId);
     box.style.display = 'block';
     if (!this._navMove){ this._navMove = (e)=> this._positionNavPreview((e.clientX||0),(e.clientY||0)); }
@@ -5985,7 +7832,6 @@ class HotspotProject {
         buttonOpacity: 1.0,
       },
       buttonImages: {
-        portal: "images/up-arrow.png",
         play: "images/play.png",
         pause: "images/pause.png",
       },
@@ -6003,9 +7849,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async addRealAssets(imagesFolder, audioFolder) {
     try {
+      // Warn when running from file:// where fetches will likely fail
+      try {
+        if (typeof location !== "undefined" && location.protocol === "file:") {
+          if (!this._fileProtocolWarned) {
+            this._fileProtocolWarned = true;
+            console.warn("Export is running from file://. Real icons may not be readable. Export from a server (e.g., http://localhost:3000) to include real icons.");
+            try { alert("Export from a server to include real icons. Running from file:// may embed fallback icons."); } catch (_) {}
+          }
+        }
+      } catch (_) {}
+
       // Fetch real assets from the current project
       const assetsToFetch = [
-        { path: "./images/up-arrow.png", filename: "up-arrow.png" },
         { path: "./images/close.png", filename: "close.png" },
         { path: "./images/play.png", filename: "play.png" },
         { path: "./images/pause.png", filename: "pause.png" },
@@ -6019,12 +7875,12 @@ document.addEventListener('DOMContentLoaded', () => {
             const blob = await response.blob();
             imagesFolder.file(asset.filename, blob);
           } else {
-            // If can't fetch, create a proper placeholder
-            await this.createProperPlaceholder(imagesFolder, asset.filename);
+            // If can't fetch, embed our default PNG for consistency
+            await this.addEmbeddedDefaultIcon(imagesFolder, asset.filename);
           }
         } catch (error) {
-          console.warn(`Could not fetch ${asset.path}, creating placeholder`);
-          await this.createProperPlaceholder(imagesFolder, asset.filename);
+          console.warn(`Could not fetch ${asset.path}, embedding default icon`);
+          await this.addEmbeddedDefaultIcon(imagesFolder, asset.filename);
         }
       }
 
@@ -6040,81 +7896,65 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     } catch (error) {
       console.warn("Error adding assets:", error);
-      // Fallback to creating all placeholders
-      await this.createAllPlaceholders(imagesFolder);
+      // Fallback to embedding all defaults
+      await this.embedAllDefaultIcons(imagesFolder);
     }
   }
 
-  async createProperPlaceholder(imagesFolder, filename) {
+  // Embed deterministic default PNGs (via canvas → blob) so exports are consistent
+  async addEmbeddedDefaultIcon(imagesFolder, filename) {
+    const blob = await this._makeDefaultIconBlob(filename);
+    imagesFolder.file(filename, blob);
+  }
+
+  async embedAllDefaultIcons(imagesFolder) {
+    const placeholders = ["close.png", "play.png", "pause.png", "scene1.jpg"];
+    for (const filename of placeholders) {
+      await this.addEmbeddedDefaultIcon(imagesFolder, filename);
+    }
+  }
+
+  _makeDefaultIconBlob(filename) {
     return new Promise((resolve) => {
-      // Create a proper minimal PNG instead of SVG
       const canvas = document.createElement("canvas");
       canvas.width = 64;
       canvas.height = 64;
       const ctx = canvas.getContext("2d");
 
-      // Create different icons based on filename
-      if (filename.includes("up-arrow") || filename.includes("hotspot")) {
-        // Arrow up icon
-        ctx.fillStyle = "#4CAF50";
+      // Draw defaults to match our shipped icons
+      if (filename.includes("close")) {
+        ctx.fillStyle = "#f44336"; // red
         ctx.fillRect(0, 0, 64, 64);
-        ctx.fillStyle = "white";
-        ctx.font = "bold 24px Arial";
-        ctx.textAlign = "center";
-        ctx.fillText("↑", 32, 40);
-      } else if (filename.includes("close")) {
-        // Close icon
-        ctx.fillStyle = "#f44336";
-        ctx.fillRect(0, 0, 64, 64);
-        ctx.fillStyle = "white";
+        ctx.fillStyle = "#ffffff";
         ctx.font = "bold 20px Arial";
         ctx.textAlign = "center";
         ctx.fillText("✕", 32, 40);
       } else if (filename.includes("play")) {
-        // Play icon
-        ctx.fillStyle = "#2196F3";
+        ctx.fillStyle = "#2196F3"; // blue
         ctx.fillRect(0, 0, 64, 64);
-        ctx.fillStyle = "white";
+        ctx.fillStyle = "#ffffff";
         ctx.font = "bold 20px Arial";
         ctx.textAlign = "center";
         ctx.fillText("▶", 32, 40);
       } else if (filename.includes("pause")) {
-        // Pause icon
-        ctx.fillStyle = "#FF9800";
+        ctx.fillStyle = "#FF9800"; // orange
         ctx.fillRect(0, 0, 64, 64);
-        ctx.fillStyle = "white";
+        ctx.fillStyle = "#ffffff";
         ctx.font = "bold 20px Arial";
         ctx.textAlign = "center";
         ctx.fillText("⏸", 32, 40);
       } else {
-        // Default placeholder
+        // Generic placeholder for any unexpected image
         ctx.fillStyle = "#9E9E9E";
         ctx.fillRect(0, 0, 64, 64);
-        ctx.fillStyle = "white";
+        ctx.fillStyle = "#ffffff";
         ctx.font = "bold 12px Arial";
         ctx.textAlign = "center";
         ctx.fillText("IMG", 32, 40);
       }
 
-      // Convert to blob and add to zip
-      canvas.toBlob((blob) => {
-        imagesFolder.file(filename, blob);
-        resolve();
-      }, "image/png");
+      canvas.toBlob((blob) => resolve(blob), "image/png");
     });
-  }
-
-  async createAllPlaceholders(imagesFolder) {
-    const placeholders = [
-      "up-arrow.png",
-      "close.png",
-      "play.png",
-      "pause.png",
-      "scene1.jpg",
-    ];
-    for (const filename of placeholders) {
-      await this.createProperPlaceholder(imagesFolder, filename);
-    }
   }
 
   // Enhanced coordinate calculation methods
@@ -6349,11 +8189,37 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (audio) {
+      // Set the basic structure first
       this.scenes[this.currentScene].globalSound = {
         audio: audio,
         volume: volume,
         enabled: true,
       };
+
+      // If using a File, persist into IndexedDB and switch to blob URL
+      if (audio instanceof File) {
+        (async () => {
+          try {
+            const storageKey = this.scenes[this.currentScene].globalSound.audioStorageKey || `audio_global_${this.currentScene}`;
+            const saved = await this.saveAudioToIDB(storageKey, audio);
+            if (saved) {
+              const blobURL = URL.createObjectURL(audio);
+              this.scenes[this.currentScene].globalSound.audioStorageKey = storageKey;
+              this.scenes[this.currentScene].globalSound.audioFileName = audio.name || null;
+              this.scenes[this.currentScene].globalSound.audio = blobURL;
+              this.saveScenesData();
+            }
+          } catch (e) {
+            console.warn("[GlobalSound] Failed to save audio to IndexedDB", e);
+          }
+        })();
+      } else if (typeof audio === "string") {
+        // If switching to URL-based audio, ensure we clear any stale storage keys
+        if (this.scenes[this.currentScene].globalSound) {
+          delete this.scenes[this.currentScene].globalSound.audioStorageKey;
+          delete this.scenes[this.currentScene].globalSound.audioFileName;
+        }
+      }
     } else {
       this.scenes[this.currentScene].globalSound = null;
     }
@@ -6388,6 +8254,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Update editor sound button state
     this.updateEditorSoundButton();
+
+    // Sync the visible Global Sound switch visuals to the current checkbox state
+    this._syncGlobalSoundToggleUI();
   }
 
   playGlobalSound() {
@@ -6709,85 +8578,238 @@ document.addEventListener('DOMContentLoaded', () => {
       });
   }
 
-  loadCurrentScene() {
+  async loadCurrentScene() {
     const scene = this.scenes[this.currentScene];
     const skybox = document.getElementById("skybox");
+    const sceneEl = document.querySelector("a-scene");
 
     console.log(`Loading scene: ${this.currentScene}`, scene); // Debug log
 
-    // Create a unique asset ID for this scene load
-    const uniqueId = `panorama-${this.currentScene}-${Date.now()}`;
-
-    // Create a new panorama asset element
-    const newPanorama = document.createElement("img");
-    newPanorama.id = uniqueId;
-    newPanorama.crossOrigin = "anonymous"; // Important for URL images
-
-    // Handle both URL and data URL images
-    if (
-      scene.image.startsWith("data:") ||
-      scene.image.startsWith("http://") ||
-      scene.image.startsWith("https://")
-    ) {
-      newPanorama.src = scene.image;
-    } else {
-      // For relative paths, ensure proper formatting
-      newPanorama.src = scene.image.startsWith("./")
-        ? scene.image
-        : `./${scene.image}`;
+    // Clear any existing videosphere
+    const existingVideosphere = document.getElementById("videosphere");
+    if (existingVideosphere) {
+      existingVideosphere.remove();
     }
 
-    // Get the assets container and add the new panorama
-    const assets = document.querySelector("a-assets");
-
-    // Remove any old panorama assets to prevent memory leaks
-    const oldPanoramas = assets.querySelectorAll("img[id^='panorama-']");
-    oldPanoramas.forEach((img) => {
-      if (img.id !== uniqueId) {
-        img.remove();
-      }
-    });
-
-    assets.appendChild(newPanorama);
-
-    // Set up loading handlers
-    newPanorama.onload = () => {
-      console.log("New panorama loaded successfully:", scene.image);
-
-      // Temporarily hide skybox to avoid flicker
+    // Handle video scenes
+  if (scene.type === "video" && scene.videoSrc) {
+      console.log("Loading video scene:", scene.videoSrc);
+      
+      // Hide regular skybox
       skybox.setAttribute("visible", "false");
+      
+      // Create videosphere
+      let videosphere = document.createElement("a-videosphere");
+      videosphere.id = "videosphere";
+      videosphere.setAttribute("rotation", "0 -90 0"); // Adjust rotation if needed
+      sceneEl.appendChild(videosphere);
 
-      // Update skybox to use the new asset
-      setTimeout(() => {
-        skybox.setAttribute("src", `#${uniqueId}`);
+      // Get or create video element
+      let videoEl = document.getElementById("scene-video-dynamic");
+      if (!videoEl) {
+        videoEl = document.createElement("video");
+        videoEl.id = "scene-video-dynamic";
+        videoEl.loop = true;
+        videoEl.muted = true; // Start muted for autoplay
+        videoEl.playsInline = true;
+        videoEl.setAttribute("webkit-playsinline", "");
+        videoEl.style.display = "none";
+        document.querySelector("a-assets").appendChild(videoEl);
+      }
+
+      // Decide crossorigin based on source to avoid remote CORS playback errors
+      const isRemoteVideoSrc = typeof scene.videoSrc === "string" && (scene.videoSrc.startsWith("http://") || scene.videoSrc.startsWith("https://"));
+      if (isRemoteVideoSrc) {
+        try { videoEl.removeAttribute("crossorigin"); } catch (_) {}
+      } else {
+        try { videoEl.setAttribute("crossorigin", "anonymous"); } catch (_) {}
+      }
+
+      // Load video source
+      if (videoEl.src !== scene.videoSrc) {
+        videoEl.src = scene.videoSrc;
+        videoEl.load();
+      }
+
+      // Set videosphere to use this video
+      videosphere.setAttribute("src", "#scene-video-dynamic");
+
+      // Attempt autoplay (fallback to play on first user click)
+      const playVideo = () => {
+        videoEl.play().catch(err => {
+          console.log("Autoplay blocked, waiting for user interaction:", err);
+          const playOnClick = () => {
+            videoEl.play();
+            document.removeEventListener("click", playOnClick);
+          };
+          document.addEventListener("click", playOnClick, { once: true });
+        });
+      };
+
+      // Video error handler (missing blob, etc.)
+      const onError = () => {
+        console.warn("Video failed to load:", scene.videoSrc);
+        alert("Failed to load the video for this scene. If it was added from a local file, try re-selecting the file or ensure browser storage permissions allow keeping large files.");
+        // Cleanup videosphere and show skybox fallback
+        try { videosphere.remove(); } catch(_) {}
         skybox.setAttribute("visible", "true");
+        this.hideVideoControls();
+      };
+      videoEl.addEventListener("error", onError, { once: true });
 
-        console.log("Skybox updated with new image");
+      // Wait for video metadata and then play
+      videoEl.addEventListener("loadedmetadata", () => {
+        console.log("Video metadata loaded");
+        playVideo();
+        this.hideSceneLoadingOverlay();
+      }, { once: true });
 
-        // Apply starting point after scene loads
+      // If already loaded, play immediately
+      if (videoEl.readyState >= 2) {
+        playVideo();
+        this.hideSceneLoadingOverlay();
+      }
+
+      // Update video controls UI
+      this.updateVideoControls(videoEl, scene);
+
+    } else if (scene.type === "video" && !scene.videoSrc) {
+      // No valid src (likely after refresh without IDB record) – prompt user to reselect file
+      const choose = confirm("This video scene needs the original file again. Do you want to select the video file now?");
+      if (choose) {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'video/mp4,video/webm';
+        input.onchange = async (e) => {
+          const file = e.target.files && e.target.files[0];
+          if (!file) return;
+          if (!file.type.startsWith('video/')) { alert('Please select a valid MP4/WebM video.'); return; }
+          const key = scene.videoStorageKey || this.currentScene;
+          await this.saveVideoToIDB(key, file);
+          try {
+            const url = URL.createObjectURL(file);
+            scene.type = 'video';
+            scene.videoSrc = url;
+            scene.videoStorageKey = key;
+            scene.videoFileName = file.name;
+            scene.videoVolume = scene.videoVolume || 0.5;
+            this.saveScenesData();
+            // reload scene now that source is available
+            this.switchToScene(this.currentScene);
+          } catch (_) {}
+        };
+        input.click();
+      } else {
+        // User skipped; fallback to image so editor remains usable
+        scene.type = 'image';
+        this.saveScenesData();
+        this.switchToScene(this.currentScene);
+      }
+      return;
+    } else {
+      // Handle image scenes (existing logic)
+      // Hide video controls for image scenes
+      this.hideVideoControls();
+
+      // Create a unique asset ID for this scene load
+      const uniqueId = `panorama-${this.currentScene}-${Date.now()}`;
+
+      // Create a new panorama asset element
+      const newPanorama = document.createElement("img");
+      newPanorama.id = uniqueId;
+      newPanorama.crossOrigin = "anonymous"; // Important for URL images
+
+      // Prefer IndexedDB image if available
+      let chosenSrc = null;
+      try {
+        if (scene.imageStorageKey && (!scene.image || typeof scene.image !== 'string' || scene.image.startsWith('blob:'))) {
+          const rec = await this.getImageFromIDB(scene.imageStorageKey);
+          if (rec && rec.blob) {
+            chosenSrc = URL.createObjectURL(rec.blob);
+            scene.image = chosenSrc; // cache blob URL
+          }
+        }
+      } catch(_) { /* ignore */ }
+
+      if (!chosenSrc) {
+        // Handle both URL and data URL images
+        if (
+          typeof scene.image === 'string' && (
+            scene.image.startsWith("data:") ||
+            scene.image.startsWith("http://") ||
+            scene.image.startsWith("https://")
+          )
+        ) {
+          chosenSrc = scene.image;
+        } else if (typeof scene.image === 'string' && scene.image.length > 0) {
+          // For relative paths, ensure proper formatting
+          chosenSrc = scene.image.startsWith("./")
+            ? scene.image
+            : `./${scene.image}`;
+        } else {
+          // fallback to default panorama
+          chosenSrc = '#main-panorama';
+        }
+      }
+      if (chosenSrc.startsWith && chosenSrc.startsWith('#')) {
+        // We'll let skybox use asset id later
+        newPanorama.src = document.querySelector(chosenSrc)?.src || '';
+      } else {
+        newPanorama.src = chosenSrc;
+      }
+
+      // Get the assets container and add the new panorama
+      const assets = document.querySelector("a-assets");
+
+      // Remove any old panorama assets to prevent memory leaks
+      const oldPanoramas = assets.querySelectorAll("img[id^='panorama-']");
+      oldPanoramas.forEach((img) => {
+        if (img.id !== uniqueId) {
+          img.remove();
+        }
+      });
+
+      assets.appendChild(newPanorama);
+
+      // Set up loading handlers
+      newPanorama.onload = () => {
+        console.log("New panorama loaded successfully:", scene.image);
+
+        // Temporarily hide skybox to avoid flicker
+        skybox.setAttribute("visible", "false");
+
+        // Update skybox to use the new asset
         setTimeout(() => {
-          this.applyStartingPoint();
-          
-          // Hide the loading overlay once scene is ready
-          this.hideSceneLoadingOverlay();
-        }, 200);
-      }, 100);
-    };
+          skybox.setAttribute("src", `#${uniqueId}`);
+          skybox.setAttribute("visible", "true");
 
-    newPanorama.onerror = () => {
-      console.error("Failed to load panorama:", scene.image);
-      alert(
-        `Failed to load scene image: ${scene.image}\nPlease check if the URL is accessible and is a valid image.`
-      );
+          console.log("Skybox updated with new image");
 
-      // Fallback to default image
-      skybox.setAttribute("src", "#main-panorama");
-      skybox.setAttribute("visible", "true");
-    };
+          // Apply starting point after scene loads
+          setTimeout(() => {
+            this.applyStartingPoint();
+            
+            // Hide the loading overlay once scene is ready
+            this.hideSceneLoadingOverlay();
+          }, 200);
+        }, 100);
+      };
 
-    // If the image is already cached and complete, trigger onload immediately
-    if (newPanorama.complete) {
-      newPanorama.onload();
+      newPanorama.onerror = () => {
+        console.error("Failed to load panorama:", scene.image);
+        alert(
+          `Failed to load scene image: ${scene.image}\nPlease check if the URL is accessible and is a valid image.`
+        );
+
+        // Fallback to default image
+        skybox.setAttribute("src", "#main-panorama");
+        skybox.setAttribute("visible", "true");
+      };
+
+      // If the image is already cached and complete, trigger onload immediately
+      if (newPanorama.complete) {
+        newPanorama.onload();
+      }
     }
 
     // Clear existing hotspots
@@ -6795,6 +8817,10 @@ document.addEventListener('DOMContentLoaded', () => {
     container.innerHTML = "";
 
     // Load hotspots for current scene
+    // Ensure hotspots array exists (safety check for loaded templates)
+    if (!Array.isArray(scene.hotspots)) {
+      scene.hotspots = [];
+    }
     this.hotspots = [...scene.hotspots];
     scene.hotspots.forEach((hotspot) => {
       this.createHotspotElement(hotspot);
@@ -6944,14 +8970,34 @@ document.addEventListener('DOMContentLoaded', () => {
       "/images/scene1.jpg"
     ];
     
-    // Only prompt if scene1 exists and uses a default image
-    if (!scene1 || !defaultImages.includes(scene1.image)) {
+    // Skip prompt if scene1 doesn't exist
+    if (!scene1) return;
+
+    // Skip prompt if scene1 is already a video with a URL or local source
+    if (scene1.type === "video" && scene1.videoSrc) {
+      console.log("ℹ️ Scene 1 already uses a video source, skipping prompt");
+      return;
+    }
+
+    // Only prompt if scene1 uses the default image
+    if (!defaultImages.includes(scene1.image)) {
       console.log("ℹ️ Scene 1 has custom image, skipping prompt");
       return;
     }
 
-    // Show prompt dialog
+    // Show prompt dialog (with a re-check right before rendering to avoid race conditions)
     setTimeout(() => {
+      // Re-check current state in case scene1 changed to video or custom image meanwhile
+      const recheck = this.scenes.scene1;
+      if (!recheck) return;
+      if (recheck.type === "video" && recheck.videoSrc) {
+        console.log("ℹ️ Skipping welcome prompt: scene1 is video now");
+        return;
+      }
+      if (!defaultImages.includes(recheck.image)) {
+        console.log("ℹ️ Skipping welcome prompt: scene1 image customized");
+        return;
+      }
       const dialog = document.createElement("div");
       dialog.style.cssText = `
         position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -6962,10 +9008,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
       dialog.innerHTML = `
         <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px; border-radius: 16px; color: white; max-width: 500px; box-shadow: 0 20px 60px rgba(0,0,0,0.5); text-align: center;">
-          <div style="font-size: 48px; margin-bottom: 20px;">🖼️</div>
+          <div style="font-size: 48px; margin-bottom: 20px;">🎬</div>
           <h2 style="margin: 0 0 15px 0; font-size: 28px; font-weight: bold;">Welcome to VR Hotspot Editor!</h2>
           <p style="color: #f0f0f0; margin-bottom: 25px; font-size: 16px; line-height: 1.6;">
-            You're currently using the default scene image. Would you like to change it to your own 360° image?
+            You're currently using the default scene media. Would you like to change it to your own 360° image or 360° video?
           </p>
           
           <div style="display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;">
@@ -6975,6 +9021,20 @@ document.addEventListener('DOMContentLoaded', () => {
               box-shadow: 0 4px 12px rgba(0,0,0,0.2); transition: transform 0.2s;
             " onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
               📁 Change Image
+            </button>
+            <button id="change-scene-video-btn" style="
+              background: #9C27B0; color: white; border: none; padding: 15px 30px;
+              border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold;
+              box-shadow: 0 4px 12px rgba(0,0,0,0.2); transition: transform 0.2s;
+            " onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
+              🎥 Use Video File
+            </button>
+            <button id="change-scene-video-url-btn" style="
+              background: #673AB7; color: white; border: none; padding: 15px 30px;
+              border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold;
+              box-shadow: 0 4px 12px rgba(0,0,0,0.2); transition: transform 0.2s;
+            " onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
+              🔗 Use Video URL
             </button>
             
             <button id="keep-default-btn" style="
@@ -7013,6 +9073,60 @@ document.addEventListener('DOMContentLoaded', () => {
         this.editSceneImage("scene1");
       };
 
+      const videoBtn = document.getElementById("change-scene-video-btn");
+      if (videoBtn) {
+        videoBtn.onclick = () => {
+          document.body.removeChild(dialog);
+          // Reuse the addSceneVideoFromFile flow but apply to scene1
+          const input = document.createElement('input');
+          input.type = 'file';
+          input.accept = 'video/mp4,video/webm';
+          input.onchange = async (e) => {
+            const file = e.target.files && e.target.files[0];
+            if (!file) return;
+            if (!file.type.startsWith('video/')) { alert('Please select a valid MP4/WebM video.'); return; }
+            const storageKey = 'video_scene1';
+            await this.saveVideoToIDB(storageKey, file);
+            const url = URL.createObjectURL(file);
+            const sc = this.scenes.scene1 || {};
+            sc.type = 'video';
+            sc.videoSrc = url;
+            sc.videoStorageKey = storageKey;
+            sc.videoFileName = file.name;
+            sc.videoVolume = 0.5;
+            this.scenes.scene1 = sc;
+            this.saveScenesData();
+            this.switchToScene('scene1');
+          };
+          input.click();
+        };
+      }
+
+      const videoUrlBtn = document.getElementById("change-scene-video-url-btn");
+      if (videoUrlBtn) {
+        videoUrlBtn.onclick = async () => {
+          document.body.removeChild(dialog);
+          const url = prompt(
+            `Enter the URL of the 360° video for "${(this.scenes.scene1 && this.scenes.scene1.name) || "Scene 1"}":\n(Direct link to MP4/WebM file)`,
+            (this.scenes.scene1 && this.scenes.scene1.videoSrc && this.scenes.scene1.videoSrc.startsWith("http") ? this.scenes.scene1.videoSrc : "https://")
+          );
+          if (!url || url === "https://") return;
+          try { new URL(url); } catch (_) { alert("Please enter a valid URL"); return; }
+
+          const sc = this.scenes.scene1 || {};
+          sc.type = 'video';
+          sc.videoSrc = url;
+          sc.videoFileName = url.split('/').pop();
+          sc.videoVolume = sc.videoVolume || 0.5;
+          this.scenes.scene1 = sc;
+          this.saveScenesData();
+
+          // Auto-download to local with loader and then switch scene
+          await this.autoDownloadRemoteVideo('scene1', url);
+          this.switchToScene('scene1');
+        };
+      }
+
       // Keep Default button
       document.getElementById("keep-default-btn").onclick = () => {
         document.body.removeChild(dialog);
@@ -7033,49 +9147,106 @@ document.addEventListener('DOMContentLoaded', () => {
     `;
 
     dialog.innerHTML = `
-      <div style="background: #2a2a2a; padding: 30px; border-radius: 10px; color: white; max-width: 500px;">
-        <h3 style="margin-top: 0; color: #4CAF50;">Add Scene Image</h3>
-        <p>Choose how you want to add the 360° image for "${name}":</p>
+      <div style="background: #2a2a2a; padding: 30px; border-radius: 10px; color: white; max-width: 550px;">
+        <h3 style="margin-top: 0; color: #4CAF50;">Add New Scene</h3>
+        <p>Choose media type for "${name}":</p>
         
+        <!-- Media Type Selection -->
         <div style="margin: 20px 0;">
-          <button id="upload-file" style="
-            background: #4CAF50; color: white; border: none; padding: 15px 25px;
-            border-radius: 6px; cursor: pointer; margin: 5px; width: 200px;
-            font-size: 14px; font-weight: bold;
-          ">📁 Upload Image File</button>
-          <div style="font-size: 12px; color: #ccc; margin-left: 5px;">
-            Upload an image from your computer
+          <label style="display: block; margin-bottom: 8px; font-weight: bold; color: #4CAF50;">
+            Media Type:
+          </label>
+          <select id="new-scene-media-type" style="
+            width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #555;
+            background: #333; color: white; font-size: 14px; cursor: pointer;
+          ">
+            <option value="image">🖼️ 360° Image</option>
+            <option value="video">🎥 360° Video</option>
+          </select>
+        </div>
+
+        <!-- Image Options -->
+        <div id="new-scene-image-options" style="display: block;">
+          <div style="margin: 15px 0;">
+            <button id="upload-image-file-new" style="
+              background: #4CAF50; color: white; border: none; padding: 12px 20px;
+              border-radius: 6px; cursor: pointer; width: 100%; font-size: 14px; font-weight: bold;
+            ">📁 Upload Image File</button>
+            <div style="font-size: 11px; color: #999; margin-top: 5px; text-align: center;">
+              Upload a 360° image from your computer
+            </div>
+          </div>
+          <div style="margin: 15px 0;">
+            <button id="use-image-url-new" style="
+              background: #2196F3; color: white; border: none; padding: 12px 20px;
+              border-radius: 6px; cursor: pointer; width: 100%; font-size: 14px; font-weight: bold;
+            ">🌐 Use Image URL</button>
+            <div style="font-size: 11px; color: #999; margin-top: 5px; text-align: center;">
+              Use an image from the internet
+            </div>
           </div>
         </div>
-        
-        <div style="margin: 20px 0;">
-          <button id="use-url" style="
-            background: #2196F3; color: white; border: none; padding: 15px 25px;
-            border-radius: 6px; cursor: pointer; margin: 5px; width: 200px;
-            font-size: 14px; font-weight: bold;
-          ">🌐 Use Image URL</button>
-          <div style="font-size: 12px; color: #ccc; margin-left: 5px;">
-            Use an image from the internet
+
+        <!-- Video Options -->
+        <div id="new-scene-video-options" style="display: none;">
+          <div style="margin: 15px 0;">
+            <button id="upload-video-file-new" style="
+              background: #9C27B0; color: white; border: none; padding: 12px 20px;
+              border-radius: 6px; cursor: pointer; width: 100%; font-size: 14px; font-weight: bold;
+            ">� Upload Video File</button>
+            <div style="font-size: 11px; color: #999; margin-top: 5px; text-align: center;">
+              MP4/WebM • 360° equirectangular format
+            </div>
+          </div>
+          <div style="margin: 15px 0;">
+            <button id="use-video-url-new" style="
+              background: #673AB7; color: white; border: none; padding: 12px 20px;
+              border-radius: 6px; cursor: pointer; width: 100%; font-size: 14px; font-weight: bold;
+            ">🔗 Use Video URL</button>
+            <div style="font-size: 11px; color: #999; margin-top: 5px; text-align: center;">
+              Direct link to MP4/WebM file
+            </div>
           </div>
         </div>
         
         <button id="cancel-scene" style="
           background: #666; color: white; border: none; padding: 10px 20px;
-          border-radius: 4px; cursor: pointer; margin-top: 10px;
+          border-radius: 4px; cursor: pointer; margin-top: 10px; width: 100%; font-weight: bold;
         ">Cancel</button>
       </div>
     `;
 
     document.body.appendChild(dialog);
 
-    document.getElementById("upload-file").onclick = () => {
+    // Media type toggle
+    dialog.querySelector("#new-scene-media-type").addEventListener("change", (e) => {
+      const isVideo = e.target.value === "video";
+      dialog.querySelector("#new-scene-image-options").style.display = isVideo ? "none" : "block";
+      dialog.querySelector("#new-scene-video-options").style.display = isVideo ? "block" : "none";
+    });
+
+    // Image upload from file
+    document.getElementById("upload-image-file-new").onclick = () => {
       document.body.removeChild(dialog);
       this.addSceneFromFile(name);
     };
 
-    document.getElementById("use-url").onclick = () => {
+    // Image from URL
+    document.getElementById("use-image-url-new").onclick = () => {
       document.body.removeChild(dialog);
       this.addSceneFromURL(name);
+    };
+
+    // Video upload from file
+    document.getElementById("upload-video-file-new").onclick = () => {
+      document.body.removeChild(dialog);
+      this.addSceneVideoFromFile(name);
+    };
+
+    // Video from URL
+    document.getElementById("use-video-url-new").onclick = () => {
+      document.body.removeChild(dialog);
+      this.addSceneVideoFromURL(name);
     };
 
     document.getElementById("cancel-scene").onclick = () => {
@@ -7092,20 +9263,35 @@ document.addEventListener('DOMContentLoaded', () => {
       const file = e.target.files[0];
       if (!file) return;
 
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const sceneId = `scene_${Date.now()}`;
-        this.scenes[sceneId] = {
-          name: name,
-          image: e.target.result, // Use data URL for uploaded images
-          hotspots: [],
-          startingPoint: null,
-          globalSound: null,
-        };
+      (async () => {
+        try {
+          const sceneId = `scene_${Date.now()}`;
+          const storageKey = `image_scene_${sceneId}`;
+          const saved = await this.saveImageToIDB(storageKey, file);
+          if (!saved) {
+            alert("Failed to save image locally.");
+            return;
+          }
+          const blobURL = URL.createObjectURL(file);
+          this.scenes[sceneId] = {
+            name: name,
+            type: "image",
+            image: blobURL, // runtime blob URL; not persisted in localStorage
+            imageStorageKey: storageKey,
+            imageFileName: file.name,
+            videoSrc: null,
+            videoVolume: 0.5,
+            hotspots: [],
+            startingPoint: null,
+            globalSound: null,
+          };
 
-        this.finalizeNewScene(sceneId, name);
-      };
-      reader.readAsDataURL(file);
+          this.finalizeNewScene(sceneId, name);
+        } catch (err) {
+          console.error("Failed to create scene from file", err);
+          alert("Failed to add scene image.");
+        }
+      })();
     });
 
     input.click();
@@ -7137,7 +9323,10 @@ document.addEventListener('DOMContentLoaded', () => {
       const sceneId = `scene_${Date.now()}`;
       this.scenes[sceneId] = {
         name: name,
+        type: "image",
         image: url, // Use URL directly for online images
+        videoSrc: null,
+        videoVolume: 0.5,
         hotspots: [],
         startingPoint: null,
         globalSound: null,
@@ -7159,6 +9348,88 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     testImg.src = url;
+  }
+
+  addSceneVideoFromFile(name) {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "video/mp4,video/webm";
+
+    input.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      // Validate file type
+      if (!file.type.startsWith("video/")) {
+        alert("Please select a valid video file (MP4 or WebM).");
+        return;
+      }
+
+      // Warn if file is large
+      if (file.size > 200 * 1024 * 1024) {
+        if (!confirm("Warning: This video is very large (>200MB). This may cause slow loading. Continue?")) {
+          return;
+        }
+      }
+
+  const sceneId = `scene_${Date.now()}`;
+  // Save file in IndexedDB for persistence across refreshes
+  const storageKey = `video_${sceneId}`;
+  this.saveVideoToIDB(storageKey, file);
+
+  // Create object URL for immediate playback
+  const videoURL = URL.createObjectURL(file);
+      this.scenes[sceneId] = {
+        name: name,
+        type: "video",
+        image: "./images/scene1.jpg", // Placeholder image
+        videoSrc: videoURL,
+  videoStorageKey: storageKey,
+        videoFileName: file.name,
+        videoVolume: 0.5,
+        hotspots: [],
+        startingPoint: null,
+        globalSound: null,
+      };
+
+      this.finalizeNewScene(sceneId, name);
+    });
+
+    input.click();
+  }
+
+  async addSceneVideoFromURL(name) {
+    const url = prompt(
+      "Enter the URL of the 360° video:\n(Direct link to MP4/WebM file)",
+      "https://"
+    );
+    if (!url || url === "https://") return;
+
+    // Validate URL format
+    try {
+      new URL(url);
+    } catch (e) {
+      alert("Please enter a valid URL");
+      return;
+    }
+
+    const sceneId = `scene_${Date.now()}`;
+    this.scenes[sceneId] = {
+      name: name,
+      type: "video",
+      image: "./images/scene1.jpg", // Placeholder image
+      videoSrc: url,
+      videoFileName: url.split("/").pop(),
+      videoVolume: 0.5,
+      hotspots: [],
+      startingPoint: null,
+      globalSound: null,
+    };
+
+    // Automatically download remote video to local storage
+    await this.autoDownloadRemoteVideo(sceneId, url);
+
+    this.finalizeNewScene(sceneId, name);
   }
 
   finalizeNewScene(sceneId, name) {
@@ -7188,22 +9459,28 @@ document.addEventListener('DOMContentLoaded', () => {
     Object.keys(this.scenes).forEach((sceneId) => {
       const scene = this.scenes[sceneId];
       const hotspotCount = scene.hotspots.length;
-      const imageSource = scene.image.startsWith("http")
-        ? "Online"
-        : scene.image.startsWith("data:")
-        ? "Uploaded"
-        : "File";
+      const sceneType = scene.type === "video" ? "🎥 Video" : "🖼️ Image";
+      const isRemoteVideo = scene.type === "video" && scene.videoSrc && (scene.videoSrc.startsWith("http://") || scene.videoSrc.startsWith("https://"));
+      const isLocalVideo = scene.type === "video" && scene.videoSrc && scene.videoSrc.startsWith("blob:");
+      const isHttp = typeof scene.image === "string" && (scene.image.startsWith("http://") || scene.image.startsWith("https://"));
+      const isData = typeof scene.image === "string" && scene.image.startsWith("data:");
+      const isBlob = typeof scene.image === "string" && scene.image.startsWith("blob:");
+      const hasIDB = !!scene.imageStorageKey;
+      const imageSource = scene.type === "video" 
+        ? (scene.videoSrc ? (isRemoteVideo ? "Remote URL" : isLocalVideo ? "Local (IDB)" : "File") : "None")
+        : ((hasIDB || isBlob) ? "Local (IDB)" : isHttp ? "Online" : isData ? "Uploaded" : "File");
+      
       sceneListHTML += `
         <div style="display: flex; justify-content: space-between; align-items: center; padding: 15px; margin: 5px 0; background: #333; border-radius: 6px;">
           <div style="flex: 1;">
             <strong>${scene.name}</strong><br>
-            <small style="color: #ccc;">${hotspotCount} hotspot(s) • ${imageSource} image</small>
+            <small style="color: #ccc;">${hotspotCount} hotspot(s) • ${sceneType} (${imageSource})</small>
           </div>
-          <div style="display: flex; gap: 6px;">
-            <button onclick="window.hotspotEditor.editSceneImage('${sceneId}')" style="
+          <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+            <button onclick="window.hotspotEditor.editSceneMedia('${sceneId}')" style="
               background: #2196F3; color: white; border: none; padding: 6px 12px;
-              border-radius: 4px; cursor: pointer; font-size: 12px;" title="Change scene image">
-              🖼️ Edit Image
+              border-radius: 4px; cursor: pointer; font-size: 12px;" title="Change scene media">
+              ${scene.type === "video" ? "🎥" : "🖼️"} Edit Media
             </button>
             <button onclick="window.hotspotEditor.deleteScene('${sceneId}')" style="
               background: #f44336; color: white; border: none; padding: 6px 12px;
@@ -7307,17 +9584,32 @@ document.addEventListener('DOMContentLoaded', () => {
       input.onchange = (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          scene.image = e.target.result;
-          this.saveScenesData(); // Save to localStorage
-          if (sceneId === this.currentScene) {
-            this.loadCurrentScene();
+        (async () => {
+          try {
+            // Persist image in IDB
+            const storageKey = scene.imageStorageKey || `image_scene_${sceneId}`;
+            const saved = await this.saveImageToIDB(storageKey, file);
+            if (saved) {
+              const blobURL = URL.createObjectURL(file);
+              scene.type = 'image';
+              scene.imageStorageKey = storageKey;
+              scene.imageFileName = file.name;
+              scene.image = blobURL; // immediate use
+              scene.videoSrc = null;
+              this.saveScenesData();
+              if (sceneId === this.currentScene) {
+                this.loadCurrentScene();
+              }
+              close();
+              this.showStartingPointFeedback(`Updated image for "${scene.name}"`);
+            } else {
+              alert('Failed to save image locally.');
+            }
+          } catch (err) {
+            console.error('Failed to store image', err);
+            alert('Failed to store image.');
           }
-          close();
-          this.showStartingPointFeedback(`Updated image for "${scene.name}"`);
-        };
-        reader.readAsDataURL(file);
+        })();
       };
       input.click();
     };
@@ -7343,6 +9635,8 @@ document.addEventListener('DOMContentLoaded', () => {
       testImg.crossOrigin = "anonymous";
       testImg.onload = () => {
         scene.image = url;
+        delete scene.imageStorageKey;
+        delete scene.imageFileName;
         this.saveScenesData(); // Save to localStorage
         if (sceneId === this.currentScene) {
           this.loadCurrentScene();
@@ -7363,6 +9657,301 @@ document.addEventListener('DOMContentLoaded', () => {
         );
       };
       testImg.src = url;
+    };
+  }
+
+  editSceneMedia(sceneId) {
+    const scene = this.scenes[sceneId];
+    if (!scene) return;
+
+    // Close current scene manager
+    document.querySelectorAll("div").forEach((div) => {
+      if (div.style.position === "fixed" && div.style.zIndex === "10000") {
+        div.remove();
+      }
+    });
+
+    const dialog = document.createElement("div");
+    dialog.style.cssText = `
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%; 
+      background: rgba(0,0,0,0.8); z-index: 10000; display: flex; 
+      align-items: center; justify-content: center; font-family: Arial;
+    `;
+
+    dialog.innerHTML = `
+      <div style="background: #2a2a2a; padding: 30px; border-radius: 10px; color: white; max-width: 550px;">
+        <h3 style="margin-top: 0; color: #4CAF50;">🎬 Change Scene Media</h3>
+        <p style="color: #ccc;">Update "${scene.name}" with image or video:</p>
+        
+        <!-- Media Type Selection -->
+        <div style="margin: 20px 0;">
+          <label style="display: block; margin-bottom: 8px; font-weight: bold; color: #4CAF50;">
+            Media Type:
+          </label>
+          <select id="media-type-select" style="
+            width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #555;
+            background: #333; color: white; font-size: 14px; cursor: pointer;
+          ">
+            <option value="image" ${scene.type !== "video" ? "selected" : ""}>🖼️ 360° Image</option>
+            <option value="video" ${scene.type === "video" ? "selected" : ""}>🎥 360° Video</option>
+          </select>
+        </div>
+
+        <!-- Image Upload Options -->
+        <div id="image-options" style="display: ${scene.type === "video" ? "none" : "block"};">
+          <div style="margin: 15px 0;">
+            <button id="upload-image-file" style="
+              background: #4CAF50; color: white; border: none; padding: 12px 20px;
+              border-radius: 6px; cursor: pointer; width: 100%; font-size: 14px; font-weight: bold;
+            ">📁 Upload Image File</button>
+          </div>
+          <div style="margin: 15px 0;">
+            <button id="use-image-url" style="
+              background: #2196F3; color: white; border: none; padding: 12px 20px;
+              border-radius: 6px; cursor: pointer; width: 100%; font-size: 14px; font-weight: bold;
+            ">🌐 Use Image URL</button>
+          </div>
+        </div>
+
+        <!-- Video Upload Options -->
+        <div id="video-options" style="display: ${scene.type === "video" ? "block" : "none"};">
+          <div style="margin: 15px 0;">
+            <button id="upload-video-file" style="
+              background: #9C27B0; color: white; border: none; padding: 12px 20px;
+              border-radius: 6px; cursor: pointer; width: 100%; font-size: 14px; font-weight: bold;
+            ">🎥 Upload Video File</button>
+            <div style="font-size: 11px; color: #999; margin-top: 5px; text-align: center;">
+              MP4/WebM • 360° equirectangular format
+            </div>
+          </div>
+          <div style="margin: 15px 0;">
+            <button id="use-video-url" style="
+              background: #673AB7; color: white; border: none; padding: 12px 20px;
+              border-radius: 6px; cursor: pointer; width: 100%; font-size: 14px; font-weight: bold;
+            ">🔗 Use Video URL</button>
+          </div>
+        </div>
+        
+        <div style="display: flex; gap: 8px; margin-top: 25px;">
+          <button id="cancel-edit-media" style="
+            background: #666; color: white; border: none; padding: 10px 20px;
+            border-radius: 4px; cursor: pointer; flex: 1; font-weight: bold;
+          ">Cancel</button>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(dialog);
+
+    const close = () => {
+      if (dialog && dialog.parentNode) dialog.parentNode.removeChild(dialog);
+      setTimeout(() => this.showSceneManager(), 100);
+    };
+
+    // Media type toggle
+    dialog.querySelector("#media-type-select").addEventListener("change", (e) => {
+      const isVideo = e.target.value === "video";
+      dialog.querySelector("#image-options").style.display = isVideo ? "none" : "block";
+      dialog.querySelector("#video-options").style.display = isVideo ? "block" : "none";
+    });
+
+    dialog.querySelector("#cancel-edit-media").onclick = close;
+
+    // Image upload from file
+    dialog.querySelector("#upload-image-file").onclick = () => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/*";
+      input.onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        (async () => {
+          try {
+            const storageKey = scene.imageStorageKey || `image_scene_${sceneId}`;
+            const saved = await this.saveImageToIDB(storageKey, file);
+            if (saved) {
+              const blobURL = URL.createObjectURL(file);
+              scene.type = 'image';
+              scene.imageStorageKey = storageKey;
+              scene.imageFileName = file.name;
+              scene.image = blobURL;
+              scene.videoSrc = null;
+              this.saveScenesData();
+              if (sceneId === this.currentScene) {
+                this.loadCurrentScene();
+              }
+              close();
+              this.showStartingPointFeedback(`Updated to image for "${scene.name}"`);
+            } else {
+              alert('Failed to save image locally.');
+            }
+          } catch (err) {
+            console.error('Failed to store image', err);
+            alert('Failed to store image.');
+          }
+        })();
+      };
+      input.click();
+    };
+
+    // Image from URL
+    dialog.querySelector("#use-image-url").onclick = () => {
+      const url = prompt(
+        `Enter the URL of the 360° image for "${scene.name}":\n(Make sure it's a direct link to an image file)`,
+        scene.image && scene.image.startsWith("http") ? scene.image : "https://"
+      );
+      if (!url || url === "https://") return;
+
+      try {
+        new URL(url);
+      } catch (e) {
+        alert("Please enter a valid URL");
+        return;
+      }
+
+      this.showLoadingIndicator("Loading image...");
+
+      const testImg = new Image();
+      testImg.crossOrigin = "anonymous";
+      testImg.onload = () => {
+        scene.type = "image";
+        scene.image = url;
+        scene.videoSrc = null;
+        delete scene.imageStorageKey;
+        delete scene.imageFileName;
+        this.saveScenesData();
+        if (sceneId === this.currentScene) {
+          this.loadCurrentScene();
+        }
+        this.hideLoadingIndicator();
+        close();
+        this.showStartingPointFeedback(`Updated to image for "${scene.name}"`);
+      };
+      testImg.onerror = () => {
+        this.hideLoadingIndicator();
+        alert("Failed to load image from URL. Please check the URL and try again.");
+      };
+      testImg.src = url;
+    };
+
+    // Video upload from file
+    dialog.querySelector("#upload-video-file").onclick = () => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "video/mp4,video/webm";
+      input.onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        // Validate file type - check both MIME type and extension
+        const validVideoTypes = ["video/mp4", "video/webm"];
+        const validExtensions = [".mp4", ".webm"];
+        const fileExtension = file.name.toLowerCase().substring(file.name.lastIndexOf("."));
+        
+        if (!file.type.startsWith("video/") || !validVideoTypes.includes(file.type.toLowerCase())) {
+          alert("❌ Can't be selected as it is not a video file.\n\nPlease select a valid video file (MP4 or WebM only).");
+          return;
+        }
+
+        if (!validExtensions.includes(fileExtension)) {
+          alert("❌ Can't be selected as it is not a video file.\n\nOnly MP4 and WebM formats are supported.");
+          return;
+        }
+
+        // Warn if file is large
+        if (file.size > 200 * 1024 * 1024) {
+          if (!confirm("Warning: This video is very large (>200MB). This may cause slow loading. Continue?")) {
+            return;
+          }
+        }
+
+        // Create object URL for the video
+        const videoURL = URL.createObjectURL(file);
+
+        scene.type = "video";
+        scene.videoSrc = videoURL;
+        scene.videoFileName = file.name;
+        scene.videoVolume = scene.videoVolume || 0.5;
+        this.saveScenesData();
+
+        if (sceneId === this.currentScene) {
+          this.loadCurrentScene();
+        }
+
+        close();
+        this.showStartingPointFeedback(`Video "${file.name}" loaded successfully!`);
+      };
+      input.click();
+    };
+
+    // Video from URL
+    dialog.querySelector("#use-video-url").onclick = async () => {
+      const url = prompt(
+        `Enter the URL of the 360° video for "${scene.name}":\n(Direct link to MP4/WebM file)`,
+        scene.videoSrc && scene.videoSrc.startsWith("http") ? scene.videoSrc : "https://"
+      );
+      if (!url || url === "https://") return;
+
+      try {
+        new URL(url);
+      } catch (e) {
+        alert("Please enter a valid URL");
+        return;
+      }
+
+      // Validate URL extension
+      const urlLower = url.toLowerCase();
+      const validVideoExtensions = [".mp4", ".webm"];
+      const hasValidExtension = validVideoExtensions.some(ext => urlLower.includes(ext));
+      
+      if (!hasValidExtension) {
+        alert("❌ Can't be loaded as it is not a video file.\n\nURL must point to an MP4 or WebM file.\n\nExample: https://example.com/video.mp4");
+        return;
+      }
+
+      // Additional check: warn if URL looks like audio
+      const audioExtensions = [".mp3", ".wav", ".ogg", ".m4a", ".aac"];
+      const looksLikeAudio = audioExtensions.some(ext => urlLower.includes(ext));
+      
+      if (looksLikeAudio) {
+        alert("❌ Can't be loaded as it is not a video file.\n\nThis URL appears to be an audio file (MP3, WAV, etc.).\n\nPlease provide a video URL (MP4 or WebM).");
+        return;
+      }
+
+      // Try to verify content type via HEAD request (optional, may fail due to CORS)
+      try {
+        this.showLoadingIndicator("Verifying video URL...");
+        const response = await fetch(url, { method: "HEAD" });
+        const contentType = response.headers.get("content-type");
+        
+        if (contentType && !contentType.startsWith("video/")) {
+          this.hideLoadingIndicator();
+          alert(`❌ Can't be loaded as it is not a video file.\n\nServer reports content type: ${contentType}\n\nOnly video/mp4 and video/webm are supported.`);
+          return;
+        }
+        this.hideLoadingIndicator();
+      } catch (e) {
+        // CORS or network error - continue anyway (user might have valid URL)
+        this.hideLoadingIndicator();
+        console.warn("Could not verify content type (CORS?), proceeding anyway:", e);
+      }
+
+      // Set to video with temporary remote URL, then auto-download to local
+      scene.type = "video";
+      scene.videoSrc = url;
+      scene.videoFileName = url.split("/").pop();
+      scene.videoVolume = scene.videoVolume || 0.5;
+      this.saveScenesData();
+
+      // Begin auto-download with loader
+      await this.autoDownloadRemoteVideo(sceneId, url);
+
+      if (sceneId === this.currentScene) {
+        this.loadCurrentScene();
+      }
+
+      close();
+      this.showStartingPointFeedback(`Video URL set for "${scene.name}"`);
     };
   }
 
@@ -7495,8 +10084,7 @@ AFRAME.registerComponent("editor-spot", {
     const data = this.data;
     const el = this.el;
 
-    // Don't override the src - let createHotspotElement set the appropriate icon
-    // el.setAttribute("src", "#hotspot"); // REMOVED - was overriding icon choice
+  // Don't override the src - let createHotspotElement set the appropriate icon
     el.setAttribute("class", "clickable");
 
     // Add highlight animation
@@ -7844,7 +10432,29 @@ AFRAME.registerComponent("editor-spot", {
     /******************  AUDIO  ******************/
     if (data.audio) {
       const audioEl = document.createElement("a-sound");
-      audioEl.setAttribute("src", data.audio);
+      // Stabilize blob/data audio by routing through <a-assets>
+      let initSrc = data.audio;
+      if (typeof initSrc === "string" && (initSrc.startsWith("blob:") || initSrc.startsWith("data:"))) {
+        try {
+          const assets = document.querySelector('a-assets') || (function(){
+            const scn = document.querySelector('a-scene') || document.querySelector('scene, a-scene');
+            const a = document.createElement('a-assets');
+            if (scn) scn.insertBefore(a, scn.firstChild);
+            return a;
+          })();
+          const assetId = "audio_ed_" + (el.id || ("el_" + Math.random().toString(36).slice(2)));
+          let assetEl = assets.querySelector("#" + assetId);
+          if (!assetEl) {
+            assetEl = document.createElement('audio');
+            assetEl.setAttribute('id', assetId);
+            assetEl.setAttribute('crossorigin', 'anonymous');
+            assets.appendChild(assetEl);
+          }
+          assetEl.setAttribute('src', initSrc);
+          initSrc = "#" + assetId;
+        } catch(_) { /* ignore, fallback to direct */ }
+      }
+      audioEl.setAttribute("src", initSrc);
       audioEl.setAttribute("autoplay", "false");
       audioEl.setAttribute("loop", "true");
       el.appendChild(audioEl);
@@ -8113,12 +10723,28 @@ class StudentSubmission {
 }
 
 // Clear localStorage function
-function clearLocalStorage() {
+async function clearLocalStorage() {
   try {
-    // Clear VR Hotspots specific data
+    // Clear VR Hotspots specific data from localStorage
     localStorage.removeItem("vr-hotspot-scenes-data");
     localStorage.removeItem("vr-hotspot-css-styles");
     console.log("✅ Cleared VR Hotspots localStorage data");
+
+    // Also clear IndexedDB stores for videos, images and audio
+    try {
+      if (window.hotspotEditor && typeof window.hotspotEditor.clearAllVideosFromIDB === 'function') {
+        await window.hotspotEditor.clearAllVideosFromIDB();
+      }
+      if (window.hotspotEditor && typeof window.hotspotEditor.clearAllImagesFromIDB === 'function') {
+        await window.hotspotEditor.clearAllImagesFromIDB();
+      }
+      if (window.hotspotEditor && typeof window.hotspotEditor.clearAllAudiosFromIDB === 'function') {
+        await window.hotspotEditor.clearAllAudiosFromIDB();
+      }
+      console.log("✅ Cleared IndexedDB videos, images, and audio");
+    } catch (e) {
+      console.warn("Warning: Failed to clear some IndexedDB stores", e);
+    }
 
     // Show notification to user
     alert("Data cleared! The page will reload with fresh data.");
